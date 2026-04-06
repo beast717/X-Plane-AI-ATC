@@ -10,10 +10,11 @@ import keyboard
 import numpy as np
 import requests
 import time
+import math
 
 # --- CONFIGURATION ---
 GROQ_API_KEY = "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"
-SIMBRIEF_USERNAME = "YOUR_SIMBRIEF_USERNAME" # Change this to your Simbrief username to automatically load cleared routes!
+SIMBRIEF_USERNAME = "meddho11" # Change this to your Simbrief username to automatically load cleared routes!
 client = Groq(api_key=GROQ_API_KEY)
 FILENAME = "mic_input.wav"
 
@@ -70,15 +71,40 @@ def generate_squelch():
         audio = np.int16(noise / np.max(np.abs(noise)) * 32767)
         write("squelch.wav", fs, audio)
 
+def generate_heavy_static():
+    """Generates pure radio static when out of range."""
+    if not os.path.exists("heavy_static.wav"):
+        fs = 44100
+        duration = 1.5 # 1.5 seconds of loud static
+        t = np.linspace(0, duration, int(fs * duration), endpoint=False)
+        noise = np.random.normal(0, 0.3, len(t))
+        audio = np.int16(noise * 32767)
+        write("heavy_static.wav", fs, audio)
+
+def haversine_nm(lat1, lon1, lat2, lon2):
+    """Calculate distance between two coordinates in Nautical Miles."""
+    R = 3440.065 # Earth radius in NM
+    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    return R * c
+
 async def run_atc_loop():
     pygame.mixer.init()
     generate_squelch()
+    generate_heavy_static()
     squelch_sound = pygame.mixer.Sound("squelch.wav")
+    heavy_static_sound = pygame.mixer.Sound("heavy_static.wav")
     chat_history = []
     
     # 🌍 Cache for Runways & Airport Info to prevent spamming the APIs
     location_cache = {}
     runway_cache = {}
+    
+    # 📻 Radio Line of Sight Tracker
+    active_station = {"mhz": 0.0, "lat": 0.0, "lon": 0.0}
 
     def get_runways_from_overpass(lat, lon, radius=5000):
         # Round digits to cache the grid instead of firing for every meter moved
@@ -294,6 +320,33 @@ async def run_atc_loop():
             atc_role = "UNICOM" # UNICOM (untowered)
         elif 123.05 < com1_mhz <= 126.0: # Sola Clearance is 121.925 or 125+ in standard airspace
             atc_role = "CLEARANCE DELIVERY"
+
+        # VHF RADIO PHYSICS (Line of Sight & Range Checks)
+        # Lock onto the station's coordinates when we first tune the frequency
+        if abs(com1_mhz - active_station["mhz"]) > 0.01:
+            active_station["mhz"] = com1_mhz
+            active_station["lat"] = lat
+            active_station["lon"] = lon
+
+        # Calculate distance to locked station location
+        station_distance_nm = haversine_nm(lat, lon, active_station["lat"], active_station["lon"])
+        
+        # Max LOS distance rough formula: 1.23 * sqrt(altitude in feet) + 10 NM base
+        max_los_nm = 1.23 * math.sqrt(max(alt_ft, 0)) + 10.0
+        
+        # Restrict heavily by ATC role (Ground shouldn't be heard from 100 NM away even at FL350)
+        if atc_role in ["GROUND", "CLEARANCE DELIVERY"]:
+            max_range = min(max_los_nm, 15.0) # Ground radios are weak
+        elif atc_role == "TOWER":
+            max_range = min(max_los_nm, 50.0) # Tower reaches a bit further
+        else:
+            max_range = max_los_nm # Center has huge antennas
+            
+        if station_distance_nm > max_range:
+            print(f"📻 [OUT OF RANGE] {station_distance_nm:.1f} NM away. Max range: {max_range:.1f} NM.")
+            heavy_static_sound.play()
+            await asyncio.sleep(1.5)
+            continue # ABORT THE LLM REQUEST. The controller never heard you!
 
         # 4. GET BRAIN RESPONSE (Llama 3.3 70B)
         if action == "ATIS":
