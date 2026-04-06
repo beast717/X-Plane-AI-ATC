@@ -179,7 +179,8 @@ async def run_atc_loop():
             for element in data.get('elements', []):
                 tags = element.get('tags', {})
                 ref = tags.get('ref')
-                if ref and len(ref) <= 7: # Make sure it's actually a runway like "11/29" or "09"
+                # IMPROVEMENT: Ensure it is not a helipad (e.g., "09H")
+                if ref and len(ref) <= 7 and not ref.upper().endswith('H'):
                     runways.append(ref)
             
             # Remove duplicates and clean up
@@ -241,15 +242,19 @@ async def run_atc_loop():
                 dest_lat = float(data.get("destination", {}).get("pos_lat", "0"))
                 dest_lon = float(data.get("destination", {}).get("pos_long", "0"))
                 
-                route = data.get("general", {}).get("route", "Direct")
+                route_full = data.get("general", {}).get("route", "Direct")
+                # Grab just the first SID or Waypoint for the clearance
+                route_first_wp = route_full.split()[0] if route_full else "Direct"
                 alt = data.get("general", {}).get("initial_altitude", "UNKNOWN")
+                # Convert 33000 to 330 for proper Flight Level formatting
+                alt = str(int(alt_raw) // 100) if (isinstance(alt_raw, str) and alt_raw.isdigit() and int(alt_raw) >= 18000) else alt_raw
                 
                 simbrief_cache = {
                     "origin": origin,
                     "destination": dest,
                     "dest_lat": dest_lat,
                     "dest_lon": dest_lon,
-                    "route": route,
+                    "route": route_first_wp, # Only send the first waypoint!
                     "altitude": alt
                 }
                 last_simbrief_fetch = time.time()
@@ -407,12 +412,18 @@ async def run_atc_loop():
 
         # Format location context for the AI
         location_status = "ON THE GROUND" if on_ground else "AIRBORNE"
+        # --- NEW REGIONAL LOGIC (FAA vs ICAO) ---
+        # Roughly define North America bounds (FAA rules)
+        is_faa_region = (-170 < lon < -50) and (15 < lat < 75)
+        
+        altimeter_phrase = f"altimeter {altim_inhg:.2f}" if is_faa_region else f"QNH {qnh_mb:.0f}"
+        atis_type = "FAA" if is_faa_region else "ICAO"
         
         real_metar = get_real_metar(lat, lon)
         if real_metar:
             weather_context = f"METAR: {real_metar}"
         else:
-            weather_context = f"Wind {wind_dir:03.0f} at {wind_spd_kts:.0f} knots. Altimeter {altim_inhg:.2f} (QNH {qnh_mb:.0f})."
+            weather_context = f"Wind {wind_dir:03.0f} at {wind_spd_kts:.0f} knots. {altimeter_phrase}."
 
         # ILS / NAV1 Tracking
         nav_info = ""
@@ -483,10 +494,11 @@ async def run_atc_loop():
             system_prompt = (
                 f"You are the automated ATIS broadcaster at {location_name}. "
                 f"Current weather: {weather_context}. "
-                f"Generate a short, realistic FAA ATIS broadcast. "
+                f"Generate a short, realistic {atis_type} standard ATIS broadcast. "
                 f"Start with '{location_name} Airport, information {atis_letter}...'. "
                 f"End with '...advise on initial contact, you have information {atis_letter}.' "
                 f"CRITICAL: Spell out the ATIS letter using the NATO phonetic alphabet (e.g., if it is A, write out 'Alpha'). "
+                f"Ensure you use the correct regional pressure setting ({altimeter_phrase}). "
                 f"Do not include any pleasantries or conversational filler. Output the standard script only."
             )
             messages = [{"role": "system", "content": system_prompt}]
@@ -494,7 +506,7 @@ async def run_atc_loop():
             print(f"ATC Thinking (Role: {atc_role} on {com1_mhz:.3f} MHz)...")
             system_prompt = (
                 f"You are a professional Air Traffic Controller acting at {location_name}. "
-                f"The pilot's tail number is {tail} (If 'UNKNOWN', use their stated callsign). "
+                f"The pilot's tail number is {tail} BUT if the pilot states a callsign (e.g., 'Scandinavian 123'), you MUST ignore the tail number and strictly use their spoken callsign. "
                 f"Aircraft state: {alt_ft:.0f}ft MSL, Heading {heading:03.0f}, Speed {airspeed:.0f} kts, VSI {vsi_fpm:.0f} fpm, currently {location_status}, Squawk {squawk_code}. {nav_info}\n"
                 f"Real reported runways at this physical location: {', '.join(active_runways) if active_runways else 'Unknown (assign a generic runway like 27)'}. "
                 f"Real reported taxiways at this physical location: {', '.join(active_taxiways) if active_taxiways else 'Unknown (invent realistic taxiways like A, B, C)'}. "
@@ -504,15 +516,15 @@ async def run_atc_loop():
                 f"CRITICAL ROLE AUTHORITIES & HANDOFF RULES:\n"
                 f"- If {atc_role} is UNICOM: You are NOT ATC. Tell the pilot they are on UNICOM and must tune to the correct ATC frequency for {location_name}.\n"
                 f"- If {atc_role} is GROUND: You can give IFR, pushback, and taxi clearances. When the pilot is ready for departure at the runway, explicitly tell them 'Contact Tower on 118.5'.\n"
-                f"- If {atc_role} is TOWER: You can give takeoff and landing clearances. When the pilot is airborne and climbing out, explicitly tell them 'Contact Departure on 124.5'. Upon landing and exiting the runway, tell them 'Contact Ground on 121.9'.\n"
+                f"- If {atc_role} is TOWER: You can give takeoff and landing clearances. You may instruct the aircraft to 'line up and wait runway [X]' if you need them to hold on the runway. When the pilot is airborne and climbing out, explicitly tell them 'Contact Departure on 124.5'. Upon landing and exiting the runway, tell them 'Contact Ground on 121.9'.\n"
                 f"- If {atc_role} is APPROACH/CENTER: Provide radar vectoring and approach clearances. Use the pilot's current heading ({heading:03.0f}) and airspeed ({airspeed:.0f} kts). \n"
                 f"If the pilot asks for a clearance outside your {atc_role} authority, STRICTLY DENY IT.\n"
                 f"\n--- FLIGHT PLAN & WEATHER ---\n"
                 f"CURRENT WEATHER: {weather_context} "
                 f"\nSIMBRIEF FLIGHT PLAN: {flight_plan_context}\n"
                 f"\n--- RULES ---\n"
-                f"CRITICAL: 1. ONE INSTRUCTION AT A TIME. Respond only to what the pilot is explicitly requesting right now. If they ask for pushback, ONLY give pushback, DO NOT give taxi. NEVER ask the pilot if they are ready for the next step. NEVER give taxi instructions until the pilot explicitly says 'ready for taxi'.\n"
-                f"CRITICAL: 2. ACKNOWLEDGING READBACKS: If the pilot is reading back a clearance, you MUST NOT give any further instructions automatically. DO NOT add handoffs or taxi clearances to an acknowledgement. NEVER use 'Roger' to acknowledge a clearance readback. Use strict ICAO/FAA phraseology (e.g., '[Callsign], readback correct', or just state their '[Callsign]').\n"
+                f"CRITICAL: 1. ONE INSTRUCTION AT A TIME. DO NOT ANTICIPATE. Respond only to what the pilot is explicitly requesting right now. If they ask for pushback, ONLY give pushback, DO NOT give taxi. NEVER ask the pilot if they are ready for the next step. NEVER give taxi instructions until the pilot explicitly says 'ready for taxi'.\n"
+                f"CRITICAL: 2. ACKNOWLEDGING READBACKS: Actively check the pilot's readback for errors. If they read back an incorrect altitude, heading, or runway, you MUST say 'Negative' and issue the correction. If the readback is 100% correct, acknowledge simply with their '[Callsign]'. NEVER say 'readback correct'.\n"
                 f"CRITICAL: 3. DO NOT MICROMANAGE. Maintain a professional, detached ATC tone. Avoid redundant phrasing like 'Clearance for [Callsign]'. Just say '[Callsign], cleared to...'. Simply provide the clearance or vector. Just say 'Taxi via [route] hold short runway [X]'.\n"
                 f"CRITICAL: 4. HANDOFFS MUST BE TIMED CORRECTLY AND NEVER COMBINED WITH CLEARANCES:\n"
                 f"  - Ground to Tower: DO NOT handoff during taxi clearance. ONLY instruct 'Contact Tower on 118.5' when the pilot explicitly reports holding short of the runway.\n"
@@ -521,14 +533,14 @@ async def run_atc_loop():
                 f"CRITICAL: 6. RUNWAY CONSISTENCY. Maintain a strictly consistent active runway state. Review the chat history! The runway you assign for taxi, holding short, and takeoff MUST identically match the 'expect runway' you assigned in the initial IFR clearance.\n"
                 f"CRITICAL: 7. PHONETIC ALPHABET. ALWAYS use the NATO phonetic alphabet for single letters (e.g., say 'Taxiway Alpha', not 'Taxiway A'; 'Information Bravo', not 'Information B').\n"
                 f"8. SQUAWK CODES: If squawk is 1200 instruct 'squawk [4-digit code]'.\n"
-                f"9. IFR CLEARANCE (Clearance/Ground ONLY): Assign a lower INITIAL altitude (e.g., 5000 or 7000), NOT cruise. Provide clearance limit, route (DO NOT read the entire route string; read only the first waypoint/SID, then state 'then as filed'), initial altitude, departure frequency (which is 124.5 for Departure, NEVER 121.92), squawk code, and expected runway. Do NOT give pushback or taxi instructions here.\n"
+                f"9. IFR CLEARANCE (Clearance/Ground ONLY): Format initial clearances strictly using the CRAFT acronym: Clearance limit (usually destination airport), Route (say exactly '{simbrief_data['route'] if simbrief_data else 'Direct'}, then as filed'), Altitude (e.g., 'maintain 5000, expect FL{simbrief_data['altitude'] if simbrief_data else 'unknown'} 10 minutes after departure'), Frequency (Departure 124.5), and Transponder (Squawk code). Do NOT give pushback or taxi here.\n"
                 f"10. TRANSCRIPTION: Ignore minor speech transcription artifacts ('10-20', hyphens, '121.94', weird callsign glitches like '81777'). Use the pilot's stated callsign from the transcription.\n"
                 f"11. WEATHER CONSIDERATIONS: Review the METAR. You MUST assign runways that prioritize headwinds over tailwinds. If wind speed is > 8kts, strictly avoid assigning crossing or tailwind runways if a direct headwind runway is available.\n"
                 f"12. MANAGING DESCENTS (Approach/Center): Monitor the flight plan's Distance to Destination. If distance < 120 NM and altitude > 15000, proactively instruct 'descend and maintain [lower FL/Altitude]'.\n"
-                f"13. SMART APPROACH VECTORING (Approach/Center): If distance to destination < 30 NM, use the pilot's Bearing to Dest to vector them into the localizer. (e.g. 'fly heading [intercept heading], cleared ILS approach runway [X]'). Do not give generic vectors forever.\n"
-                f"14. ALTITUDE PHRASEOLOGY: For altitudes 18,000 feet and above, you MUST use 'Flight Level' (e.g., 'climb and maintain Flight Level 290'). For altitudes below 18,000 feet, use thousands and hundreds (e.g., 'climb and maintain one two thousand').\n"
+                f"13. SMART APPROACH VECTORING (Approach/Center): When clearing for an ILS/Localizer approach, use the PTA format: Position (e.g., '7 miles from [Fix]'), Turn (e.g., 'turn left heading 240, maintain 3000 until established on the localizer'), and Clearance (e.g., 'cleared ILS runway 27 approach'). The intercept heading should be roughly 30 degrees off the runway heading.\n"
+                f"14. ALTITUDE PHRASEOLOGY: Use 'Flight Level' for altitudes above the local transition altitude. For altitudes below the transition altitude, use thousands and hundreds. Note: {location_name} may have a transition altitude much lower than 18,000 feet (e.g., 5000-7000 feet in Europe).\n"
                 f"15. SPEED CONTROL (Approach/Center): Issue speed restrictions when necessary for spacing (e.g., 'reduce speed to 250 knots', 'maintain 160 knots to the marker').\n"
-                f"16. TRANSITION ALTIMETER: When clearing an aircraft to descend below 18,000 feet for the first time, you MUST provide the local altimeter setting (e.g., 'Sola altimeter {altim_inhg:.2f}').\n"
+                f"16. TRANSITION ALTIMETER: When clearing an aircraft to descend below the transition altitude for the first time, you MUST provide the local altimeter setting (e.g., '{location_name} {altimeter_phrase}').\n"
                 f"17. MISSED APPROACH / GO-AROUND: If distance to destination is < 10 NM, altitude < 3000, and VSI is strongly positive (> 600 fpm), the aircraft is executing a missed approach. Proactively instruct 'observed going around, fly runway heading, climb and maintain [X]...'.\n"
                 f"18. RADAR CONTACT & SQUAWK: On initial contact with Departure/Center, if squawk does not match what you previously assigned, say 'squawk [code]'. If correct, say 'Radar contact [altitude]'.\n"
                 f"Keep responses strictly in professional FAA/ICAO phraseology."
