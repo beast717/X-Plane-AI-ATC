@@ -102,9 +102,30 @@ async def run_atc_loop():
     # 🌍 Cache for Runways & Airport Info to prevent spamming the APIs
     location_cache = {}
     runway_cache = {}
+    metar_cache = {}
     
     # 📻 Radio Line of Sight Tracker
     active_station = {"mhz": 0.0, "lat": 0.0, "lon": 0.0}
+
+    def get_real_metar(lat, lon):
+        # Round digits to cache the grid securely
+        cache_key = f"{round(lat, 1)},{round(lon, 1)}"
+        if cache_key in metar_cache and (time.time() - metar_cache[cache_key]['time'] < 1800):
+            return metar_cache[cache_key]['metar']
+            
+        print("🌤️ Fetching real-world METAR for current location...")
+        try:
+            bbox = f"{lat-0.5},{lon-0.5},{lat+0.5},{lon+0.5}"
+            url = f"https://aviationweather.gov/api/data/metar?format=json&bbox={bbox}"
+            r = requests.get(url, timeout=3.0)
+            data = r.json()
+            if data and len(data) > 0:
+                metar_str = data[0].get('rawOb', 'Unknown')
+                metar_cache[cache_key] = {'metar': metar_str, 'time': time.time()}
+                return metar_str
+        except Exception:
+            pass
+        return None
 
     def get_runways_from_overpass(lat, lon, radius=5000):
         # Round digits to cache the grid instead of firing for every meter moved
@@ -187,6 +208,8 @@ async def run_atc_loop():
         tail = "UNKNOWN"
         heading, airspeed = 0.0, 0.0
         squawk_code = 1200
+        nav1_freq = 0.0
+        nav1_hdef = 0.0
         
         try:
             with xpc.XPlaneConnect() as xp:
@@ -222,8 +245,19 @@ async def run_atc_loop():
                         squawk_code = int(squawk_raw[0])
                 except:
                     pass
+
+                # 4.5 ILS / NAV1 Tracking
+                try:
+                    nav1_raw = xp.getDREF("sim/cockpit/radios/nav1_freq_hz")
+                    if nav1_raw:
+                        nav1_freq = nav1_raw[0] / 100.0
+                    nav1_def = xp.getDREF("sim/cockpit2/radios/indicators/nav1_hdef_dots_pilot")
+                    if nav1_def:
+                        nav1_hdef = nav1_def[0]
+                except:
+                    pass
                     
-                # 3. Weather Data (These often change names in X-Plane 12)
+                # 5. Weather Data (These often change names in X-Plane 12)
                 try:
                     wind_dir_drefs = xp.getDREF("sim/weather/wind_direction_degs")
                     wind_dir = wind_dir_drefs[0] if wind_dir_drefs else 0
@@ -302,7 +336,22 @@ async def run_atc_loop():
         # Format location context for the AI
         location_status = "ON THE GROUND" if on_ground else "AIRBORNE"
         
-        weather_context = f"Wind {wind_dir:03.0f} at {wind_spd_kts:.0f} knots. Altimeter {altim_inhg:.2f} (QNH {qnh_mb:.0f})."
+        real_metar = get_real_metar(lat, lon)
+        if real_metar:
+            weather_context = f"METAR: {real_metar}"
+        else:
+            weather_context = f"Wind {wind_dir:03.0f} at {wind_spd_kts:.0f} knots. Altimeter {altim_inhg:.2f} (QNH {qnh_mb:.0f})."
+
+        # ILS / NAV1 Tracking
+        nav_info = ""
+        if nav1_freq >= 108.0 and not on_ground:
+            nav_info = f"NAV1 Tuned: {nav1_freq:.2f}."
+            if nav1_hdef > 1.5:
+                nav_info += " (PILOT IS DRIFTING FAR LEFT OF THE LOCALIZER)"
+            elif nav1_hdef < -1.5:
+                nav_info += " (PILOT IS DRIFTING FAR RIGHT OF THE LOCALIZER)"
+            elif abs(nav1_hdef) <= 1.5:
+                nav_info += " (PILOT IS ESTABLISHED ON LOCALIZER)"
 
         # Automatically look up pilot's filed flight plan
         simbrief_data = get_simbrief_flight_plan()
@@ -355,7 +404,7 @@ async def run_atc_loop():
             atis_letter = chr(65 + atis_number)
             system_prompt = (
                 f"You are the automated ATIS broadcaster at {location_name}. "
-                f"Current weather: Wind {wind_dir:03.0f} at {wind_spd_kts:.0f} knots. Altimeter {altim_inhg:.2f}. "
+                f"Current weather: {weather_context}. "
                 f"Generate a short, realistic FAA ATIS broadcast. "
                 f"Start with '{location_name} Airport, information {atis_letter}...'. "
                 f"End with '...advise on initial contact, you have information {atis_letter}.' "
@@ -367,7 +416,7 @@ async def run_atc_loop():
             system_prompt = (
                 f"You are a professional Air Traffic Controller acting at {location_name}. "
                 f"The pilot's tail number is {tail} (If 'UNKNOWN', use their stated callsign). "
-                f"Aircraft state: {alt_ft:.0f}ft MSL, Heading {heading:03.0f}, Speed {airspeed:.0f} kts, currently {location_status}, Squawk {squawk_code}. "
+                f"Aircraft state: {alt_ft:.0f}ft MSL, Heading {heading:03.0f}, Speed {airspeed:.0f} kts, currently {location_status}, Squawk {squawk_code}. {nav_info}"
                 f"Real reported runways at this physical location: {', '.join(active_runways) if active_runways else 'Unknown (assign a generic runway like 27)'}. "
                 f"\n--- RADIO FREQUENCY LOGIC --- \n"
                 f"The pilot is transmitting on {com1_mhz:.3f} MHz. I am explicitly assigning you the role of {atc_role}. "
@@ -375,7 +424,7 @@ async def run_atc_loop():
                 f"- If {atc_role} is UNICOM: You are NOT ATC. You CANNOT give IFR clearances, pushback, taxi, takeoff, or landing clearances. Tell the pilot they are on UNICOM and must tune to the correct ATC frequency for {location_name}.\n"
                 f"- If {atc_role} is GROUND: You can give IFR, pushback, and taxi clearances. You CANNOT give takeoff or landing clearances.\n"
                 f"- If {atc_role} is TOWER: You can give takeoff and landing clearances. You CANNOT give IFR or pushback clearances.\n"
-                f"- If {atc_role} is APPROACH/CENTER: Provide radar vectoring (assign headings and altitudes) and approach clearances. Use the pilot's current heading ({heading:03.0f}) and airspeed ({airspeed:.0f} kts) to formulate instructions.\n"
+                f"- If {atc_role} is APPROACH/CENTER: Provide radar vectoring (assign headings and altitudes) and approach clearances. Use the pilot's current heading ({heading:03.0f}) and airspeed ({airspeed:.0f} kts) to formulate instructions. Monitor ILS tracking: if the pilot is drifting, issue a correction.\n"
                 f"If the pilot asks for a clearance outside your {atc_role} authority, STRICTLY DENY IT and tell them to contact the proper frequency.\n"
                 f"\n--- FLIGHT PLAN & WEATHER ---\n"
                 f"CURRENT WEATHER: {weather_context} "
