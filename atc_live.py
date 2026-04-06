@@ -18,7 +18,7 @@ SIMBRIEF_USERNAME = "meddho11" # Change this to your Simbrief username to automa
 client = Groq(api_key=GROQ_API_KEY)
 FILENAME = "mic_input.wav"
 
-async def record_audio_ptt(fs=44100):
+async def record_audio_ptt(squelch=None, fs=44100):
     print("\n[Hold '+' to talk to ATC, or tune to 128.000 for ATIS...]")
     
     # Wait until the key is pressed OR frequency is ATIS
@@ -40,6 +40,9 @@ async def record_audio_ptt(fs=44100):
             
         await asyncio.sleep(0.1)
 
+    if squelch:
+        squelch.play()
+        
     print("--- 🎙️ RECORDING (Release '+' to stop) ---")
     
     recording = []
@@ -51,6 +54,9 @@ async def record_audio_ptt(fs=44100):
     with sd.InputStream(samplerate=fs, channels=1, callback=callback):
         while keyboard.is_pressed('+'):
             await asyncio.sleep(0.05) # Small sleep to prevent high CPU usage
+
+    if squelch:
+        squelch.play()
             
     print("--- ☑️ RECORDING FINISHED ---")
     
@@ -256,7 +262,7 @@ async def run_atc_loop():
 
     while True:
         # 1. RECORD YOUR VOICE (Push-to-Talk) or wait for ATIS
-        action = await record_audio_ptt()
+        action = await record_audio_ptt(squelch_sound)
         
         # Pull X-Plane data EARLY so the console prints match the real-time radio tuning!
         # This keeps our internal state instantly synchronized with the simulator.
@@ -566,6 +572,11 @@ async def run_atc_loop():
         squelch_sound.play()
         await asyncio.sleep(0.15) # Wait for the click to finish
 
+        # START BACKGROUND STATIC
+        static_channel = heavy_static_sound.play(loops=-1)
+        if static_channel:
+            static_channel.set_volume(0.04)
+
         pygame.mixer.music.load("response.mp3")
         pygame.mixer.music.play()
         
@@ -595,6 +606,10 @@ async def run_atc_loop():
             # Fallback if connection fails during playback
             while pygame.mixer.music.get_busy():
                 await asyncio.sleep(0.1)
+
+        # STOP BACKGROUND STATIC
+        if static_channel:
+            static_channel.stop()
 
         # 🎙️ PLAY RADIO CLICK OFF
         squelch_sound.play()
