@@ -13,6 +13,7 @@ import time
 
 # --- CONFIGURATION ---
 GROQ_API_KEY = "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"
+SIMBRIEF_USERNAME = "YOUR_SIMBRIEF_USERNAME" # Change this to your Simbrief username to automatically load cleared routes!
 client = Groq(api_key=GROQ_API_KEY)
 FILENAME = "mic_input.wav"
 
@@ -108,6 +109,44 @@ async def run_atc_loop():
             return runways
         except Exception:
             return []
+
+    simbrief_cache = None
+    last_simbrief_fetch = 0
+    def get_simbrief_flight_plan():
+        nonlocal simbrief_cache, last_simbrief_fetch
+        if not SIMBRIEF_USERNAME or SIMBRIEF_USERNAME == "YOUR_SIMBRIEF_USERNAME":
+            return None
+            
+        # Only ping the Simbrief API once every 5 minutes to prevent ratelimiting
+        if simbrief_cache and (time.time() - last_simbrief_fetch < 300):
+            return simbrief_cache
+            
+        try:
+            print(f"📡 Fetching latest SimBrief flight plan for {SIMBRIEF_USERNAME}...")
+            url = f"https://www.simbrief.com/api/xml.fetcher.php?username={SIMBRIEF_USERNAME}&json=1"
+            headers = {'User-Agent': 'XPlane-AI-ATC/1.0'}
+            res = requests.get(url, headers=headers, timeout=5.0)
+            
+            if res.status_code == 200:
+                data = res.json()
+                origin = data.get("origin", {}).get("icao_code", "UNKNOWN")
+                dest = data.get("destination", {}).get("icao_code", "UNKNOWN")
+                route = data.get("general", {}).get("route", "Direct")
+                alt = data.get("general", {}).get("initial_altitude", "UNKNOWN")
+                
+                simbrief_cache = {
+                    "origin": origin,
+                    "destination": dest,
+                    "route": route,
+                    "altitude": alt
+                }
+                last_simbrief_fetch = time.time()
+                print(f"[✅ SimBrief Plan Loaded: {origin} to {dest} at FL{alt}]")
+                return simbrief_cache
+        except Exception as e:
+            # print(f"⚠️ SimBrief error: {e}")
+            pass
+        return None
 
     while True:
         # 1. RECORD YOUR VOICE (Push-to-Talk) or wait for ATIS
@@ -239,6 +278,12 @@ async def run_atc_loop():
         
         weather_context = f"Wind {wind_dir:03.0f} at {wind_spd_kts:.0f} knots. Altimeter {altim_inhg:.2f} (QNH {qnh_mb:.0f})."
 
+        # Automatically look up pilot's filed flight plan
+        simbrief_data = get_simbrief_flight_plan()
+        flight_plan_context = "Pilot has NO IFR flight plan filed. Ask intentions."
+        if simbrief_data:
+            flight_plan_context = f"Pilot's filed IFR plan: Destination {simbrief_data['destination']}, Route: {simbrief_data['route']}, Initial FL: {simbrief_data['altitude']}."
+
         # Strictly enforce ATC role to stop the AI from guessing
         atc_role = "APPROACH/CENTER" # Default for anything high frequency (126.0+)
         if 118.0 <= com1_mhz <= 121.5:
@@ -279,13 +324,14 @@ async def run_atc_loop():
                 f"- If {atc_role} is TOWER: You can give takeoff and landing clearances. You CANNOT give IFR or pushback clearances.\n"
                 f"- If {atc_role} is APPROACH/CENTER: Provide radar vectoring (assign headings and altitudes) and approach clearances. Use the pilot's current heading ({heading:03.0f}) and airspeed ({airspeed:.0f} kts) to formulate instructions.\n"
                 f"If the pilot asks for a clearance outside your {atc_role} authority, STRICTLY DENY IT and tell them to contact the proper frequency.\n"
-                f"\n--- WEATHER & STATE ---\n"
+                f"\n--- FLIGHT PLAN & WEATHER ---\n"
                 f"CURRENT WEATHER: {weather_context} "
+                f"\nSIMBRIEF FLIGHT PLAN: {flight_plan_context}\n"
                 f"\n--- RULES ---\n"
                 f"CRITICAL: DO NOT anticipate the pilot's next request. If the pilot reads something back correctly, ONLY acknowledge it ('Roger', 'Readback correct'). DO NOT give the next clearance. "
                 f"1. SQUAWK CODES: If the pilot is airborne but their transponder squawk is 1200 or wildly incorrect, you MUST instruct them to 'squawk [4-digit code]' or 'recycle transponder' before giving further instructions. "
                 f"2. RUNWAYS: Whenever assigning a taxi, takeoff, or landing clearance, STRICTLY ONLY USE the real reported runways listed above. Do not invent runways. "
-                f"3. IFR CLEARANCE (Clearance/Ground ONLY): Provide clearance limit, route, initial altitude, real-world departure frequency, squawk code, AND expected departure runway. "
+                f"3. IFR CLEARANCE (Clearance/Ground ONLY): Base the clearance ON THE SIMBRIEF FLIGHT PLAN. Provide clearance limit (Destination), route, initial altitude, real-world departure frequency, squawk code, AND expected departure runway. "
                 f"4. READBACKS: Acknowledge briefly and naturally (e.g., 'Roger'). VARY YOUR RESPONSES. Do not repeatedly say 'readback correct'. Do not add any new instructions. "
                 f"5. PUSHBACK/START (Ground ONLY): Approve push/start and advise which way to face. "
                 f"6. TAXI (Ground ONLY): Assign a single real runway, realistic taxiways, give Altimeter/QNH, and state 'hold short of runway [X]'. "
