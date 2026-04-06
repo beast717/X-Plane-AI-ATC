@@ -106,6 +106,16 @@ def haversine_nm(lat1, lon1, lat2, lon2):
     c = 2 * math.asin(math.sqrt(a))
     return R * c
 
+def calculate_bearing(lat1, lon1, lat2, lon2):
+    """Calculate initial bearing from point 1 to point 2."""
+    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    dlon = lon2 - lon1
+    y = math.sin(dlon) * math.cos(lat2)
+    x = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
+    bearing = math.atan2(y, x)
+    bearing = math.degrees(bearing)
+    return (bearing + 360) % 360
+
 async def run_atc_loop():
     pygame.mixer.init()
     generate_squelch()
@@ -222,12 +232,17 @@ async def run_atc_loop():
                 data = res.json()
                 origin = data.get("origin", {}).get("icao_code", "UNKNOWN")
                 dest = data.get("destination", {}).get("icao_code", "UNKNOWN")
+                dest_lat = float(data.get("destination", {}).get("pos_lat", "0"))
+                dest_lon = float(data.get("destination", {}).get("pos_long", "0"))
+                
                 route = data.get("general", {}).get("route", "Direct")
                 alt = data.get("general", {}).get("initial_altitude", "UNKNOWN")
                 
                 simbrief_cache = {
                     "origin": origin,
                     "destination": dest,
+                    "dest_lat": dest_lat,
+                    "dest_lon": dest_lon,
                     "route": route,
                     "altitude": alt
                 }
@@ -246,6 +261,7 @@ async def run_atc_loop():
         # Pull X-Plane data EARLY so the console prints match the real-time radio tuning!
         # This keeps our internal state instantly synchronized with the simulator.
         on_ground = False
+        vsi_fpm = 0.0
         lat, lon, alt_ft = 0.0, 0.0, 0
         com1_mhz = 122.8
         wind_dir, wind_spd_kts, altim_inhg, qnh_mb = 0, 0, 29.92, 1013
@@ -262,6 +278,10 @@ async def run_atc_loop():
                     posi = xp.getPOSI(0)
                     lat, lon = posi[0], posi[1]
                     alt_ft = int(posi[2] * 3.28084)
+                    
+                    vsi_raw = xp.getDREF("sim/flightmodel/position/vh_ind_fpm")
+                    if vsi_raw:
+                        vsi_fpm = vsi_raw[0]
                 except:
                     pass
                 
@@ -404,6 +424,12 @@ async def run_atc_loop():
         flight_plan_context = "Pilot has NO IFR flight plan filed. Ask intentions."
         if simbrief_data:
             flight_plan_context = f"Pilot's filed IFR plan: Destination {simbrief_data['destination']}, Route: {simbrief_data['route']}, Initial FL: {simbrief_data['altitude']}."
+            
+            # Destination logic calculations
+            if simbrief_data.get('dest_lat') and simbrief_data.get('dest_lon') and not on_ground:
+                dest_dist = haversine_nm(lat, lon, simbrief_data['dest_lat'], simbrief_data['dest_lon'])
+                dest_brg = calculate_bearing(lat, lon, simbrief_data['dest_lat'], simbrief_data['dest_lon'])
+                flight_plan_context += f" | Distance to dest: {dest_dist:.1f} NM. Bearing to dest: {dest_brg:03.0f} degrees."
 
         # Strictly enforce ATC role to stop the AI from guessing
         atc_role = "APPROACH/CENTER" # Default for anything high frequency
@@ -463,7 +489,7 @@ async def run_atc_loop():
             system_prompt = (
                 f"You are a professional Air Traffic Controller acting at {location_name}. "
                 f"The pilot's tail number is {tail} (If 'UNKNOWN', use their stated callsign). "
-                f"Aircraft state: {alt_ft:.0f}ft MSL, Heading {heading:03.0f}, Speed {airspeed:.0f} kts, currently {location_status}, Squawk {squawk_code}. {nav_info}\n"
+                f"Aircraft state: {alt_ft:.0f}ft MSL, Heading {heading:03.0f}, Speed {airspeed:.0f} kts, VSI {vsi_fpm:.0f} fpm, currently {location_status}, Squawk {squawk_code}. {nav_info}\n"
                 f"Real reported runways at this physical location: {', '.join(active_runways) if active_runways else 'Unknown (assign a generic runway like 27)'}. "
                 f"Real reported taxiways at this physical location: {', '.join(active_taxiways) if active_taxiways else 'Unknown (invent realistic taxiways like A, B, C)'}. "
                 f"\n--- RADIO FREQUENCY LOGIC & HANDOFFS --- \n"
@@ -491,8 +517,14 @@ async def run_atc_loop():
                 f"8. SQUAWK CODES: If squawk is 1200 instruct 'squawk [4-digit code]'.\n"
                 f"9. IFR CLEARANCE (Clearance/Ground ONLY): Assign a lower INITIAL altitude (e.g., 5000 or 7000), NOT cruise. Provide clearance limit, route (DO NOT read the entire route string; read only the first waypoint/SID, then state 'then as filed'), initial altitude, departure frequency (which is 124.5 for Departure, NEVER 121.92), squawk code, and expected runway. Do NOT give pushback or taxi instructions here.\n"
                 f"10. TRANSCRIPTION: Ignore minor speech transcription artifacts ('10-20', hyphens, '121.94', weird callsign glitches like '81777'). Use the pilot's stated callsign from the transcription.\n"
-                f"11. VECTORING (Approach/Center ONLY): Instruct headings ('fly heading [XYZ]'), altitudes ('climb/descend and maintain [X]'). Use 'climb via SID' when appropriate.\n"
-                f"12. ALTITUDE PHRASEOLOGY: For altitudes 18,000 feet and above, you MUST use 'Flight Level' (e.g., 'climb and maintain Flight Level 290'). For altitudes below 18,000 feet, use thousands and hundreds (e.g., 'climb and maintain one two thousand').\n"
+                f"11. WEATHER CONSIDERATIONS: Review the METAR. You MUST assign runways that prioritize headwinds over tailwinds. If wind speed is > 8kts, strictly avoid assigning crossing or tailwind runways if a direct headwind runway is available.\n"
+                f"12. MANAGING DESCENTS (Approach/Center): Monitor the flight plan's Distance to Destination. If distance < 120 NM and altitude > 15000, proactively instruct 'descend and maintain [lower FL/Altitude]'.\n"
+                f"13. SMART APPROACH VECTORING (Approach/Center): If distance to destination < 30 NM, use the pilot's Bearing to Dest to vector them into the localizer. (e.g. 'fly heading [intercept heading], cleared ILS approach runway [X]'). Do not give generic vectors forever.\n"
+                f"14. ALTITUDE PHRASEOLOGY: For altitudes 18,000 feet and above, you MUST use 'Flight Level' (e.g., 'climb and maintain Flight Level 290'). For altitudes below 18,000 feet, use thousands and hundreds (e.g., 'climb and maintain one two thousand').\n"
+                f"15. SPEED CONTROL (Approach/Center): Issue speed restrictions when necessary for spacing (e.g., 'reduce speed to 250 knots', 'maintain 160 knots to the marker').\n"
+                f"16. TRANSITION ALTIMETER: When clearing an aircraft to descend below 18,000 feet for the first time, you MUST provide the local altimeter setting (e.g., 'Sola altimeter {altim_inhg:.2f}').\n"
+                f"17. MISSED APPROACH / GO-AROUND: If distance to destination is < 10 NM, altitude < 3000, and VSI is strongly positive (> 600 fpm), the aircraft is executing a missed approach. Proactively instruct 'observed going around, fly runway heading, climb and maintain [X]...'.\n"
+                f"18. RADAR CONTACT & SQUAWK: On initial contact with Departure/Center, if squawk does not match what you previously assigned, say 'squawk [code]'. If correct, say 'Radar contact [altitude]'.\n"
                 f"Keep responses strictly in professional FAA/ICAO phraseology."
             )
 
