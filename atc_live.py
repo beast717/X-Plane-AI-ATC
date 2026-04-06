@@ -102,6 +102,7 @@ async def run_atc_loop():
     # 🌍 Cache for Runways & Airport Info to prevent spamming the APIs
     location_cache = {}
     runway_cache = {}
+    taxiway_cache = {}
     metar_cache = {}
     
     # 📻 Radio Line of Sight Tracker
@@ -154,6 +155,34 @@ async def run_atc_loop():
             runways = list(set([r.replace(" ", "") for r in runways]))
             runway_cache[cache_key] = runways
             return runways
+        except Exception:
+            return []
+
+    def get_taxiways_from_overpass(lat, lon, radius=5000):
+        cache_key = f"{round(lat, 2)},{round(lon, 2)}"
+        if cache_key in taxiway_cache:
+            return taxiway_cache[cache_key]
+
+        print("🚖 Querying real-world aviation databases for active taxiways...")
+        overpass_url = "https://overpass-api.de/api/interpreter"
+        query = f"""
+        [out:json];
+        way["aeroway"="taxiway"](around:{radius},{lat},{lon});
+        out tags;
+        """
+        try:
+            r = requests.get(overpass_url, params={'data': query}, timeout=3.0)
+            data = r.json()
+            taxiways = []
+            for element in data.get('elements', []):
+                tags = element.get('tags', {})
+                ref = tags.get('ref')
+                if ref and len(ref) <= 3: # usually taxiways are 1-2 letters like "A", "M6"
+                    taxiways.append(ref.upper())
+            
+            taxiways = list(set(taxiways))
+            taxiway_cache[cache_key] = taxiways
+            return taxiways
         except Exception:
             return []
 
@@ -316,8 +345,10 @@ async def run_atc_loop():
         # Format location context for the AI
         location_name = "Local Area"
         active_runways = []
+        active_taxiways = []
         if lat != 0.0 and lon != 0.0:
             active_runways = get_runways_from_overpass(lat, lon)
+            active_taxiways = get_taxiways_from_overpass(lat, lon)
             
             # Use Nominatim for the City Name
             try:
@@ -418,13 +449,15 @@ async def run_atc_loop():
                 f"The pilot's tail number is {tail} (If 'UNKNOWN', use their stated callsign). "
                 f"Aircraft state: {alt_ft:.0f}ft MSL, Heading {heading:03.0f}, Speed {airspeed:.0f} kts, currently {location_status}, Squawk {squawk_code}. {nav_info}"
                 f"Real reported runways at this physical location: {', '.join(active_runways) if active_runways else 'Unknown (assign a generic runway like 27)'}. "
-                f"\n--- RADIO FREQUENCY LOGIC --- \n"
+                f"Real reported taxiways at this physical location: {', '.join(active_taxiways) if active_taxiways else 'Unknown (invent realistic taxiways like A, B, C)'}. "
+                f"\n--- RADIO FREQUENCY LOGIC & HANDOFFS --- \n"
                 f"The pilot is transmitting on {com1_mhz:.3f} MHz. I am explicitly assigning you the role of {atc_role}. "
-                f"CRITICAL ROLE AUTHORITIES:\n"
+                f"Available Frequencies for {location_name}: Clearance (121.92), Ground (121.9), Tower (118.5), Approach/Departure (124.5), Center (126.0). "
+                f"CRITICAL ROLE AUTHORITIES & HANDOFF RULES:\n"
                 f"- If {atc_role} is UNICOM: You are NOT ATC. You CANNOT give IFR clearances, pushback, taxi, takeoff, or landing clearances. Tell the pilot they are on UNICOM and must tune to the correct ATC frequency for {location_name}.\n"
-                f"- If {atc_role} is GROUND: You can give IFR, pushback, and taxi clearances. You CANNOT give takeoff or landing clearances.\n"
-                f"- If {atc_role} is TOWER: You can give takeoff and landing clearances. You CANNOT give IFR or pushback clearances.\n"
-                f"- If {atc_role} is APPROACH/CENTER: Provide radar vectoring (assign headings and altitudes) and approach clearances. Use the pilot's current heading ({heading:03.0f}) and airspeed ({airspeed:.0f} kts) to formulate instructions. Monitor ILS tracking: if the pilot is drifting, issue a correction.\n"
+                f"- If {atc_role} is GROUND: You can give IFR, pushback, and taxi clearances. You CANNOT give takeoff or landing clearances. When the pilot reaches the runway holding point, explicitly tell them 'Contact Tower on 118.5'.\n"
+                f"- If {atc_role} is TOWER: You can give takeoff and landing clearances. You CANNOT give IFR or pushback clearances. When the pilot is airborne and climbing out, explicitly tell them 'Contact Departure on 124.5'. Upon landing and exiting the runway, tell them 'Contact Ground on 121.9'.\n"
+                f"- If {atc_role} is APPROACH/CENTER: Provide radar vectoring (assign headings and altitudes) and approach clearances. Use the pilot's current heading ({heading:03.0f}) and airspeed ({airspeed:.0f} kts) to formulate instructions. Monitor ILS tracking: if the pilot is drifting, issue a correction. When the pilot is established on final approach, explicitly tell them 'Contact Tower on 118.5'.\n"
                 f"If the pilot asks for a clearance outside your {atc_role} authority, STRICTLY DENY IT and tell them to contact the proper frequency.\n"
                 f"\n--- FLIGHT PLAN & WEATHER ---\n"
                 f"CURRENT WEATHER: {weather_context} "
@@ -436,7 +469,7 @@ async def run_atc_loop():
                 f"3. IFR CLEARANCE (Clearance/Ground ONLY): Base the clearance ON THE SIMBRIEF FLIGHT PLAN. Provide clearance limit (Destination), route, initial altitude, real-world departure frequency, squawk code, AND expected departure runway. "
                 f"4. READBACKS: Acknowledge briefly and naturally (e.g., 'Roger'). VARY YOUR RESPONSES. Do not repeatedly say 'readback correct'. Do not add any new instructions. "
                 f"5. PUSHBACK/START (Ground ONLY): Approve push/start and advise which way to face. "
-                f"6. TAXI (Ground ONLY): Assign a single real runway, realistic taxiways, give Altimeter/QNH, and state 'hold short of runway [X]'. "
+                f"6. TAXI (Ground ONLY): Assign a single real runway, realistic routing using the real reported taxiways, give Altimeter/QNH, and state 'hold short of runway [X]'. "
                 f"7. TAKEOFF/LANDING (Tower ONLY): Provide wind conditions and state 'cleared for takeoff/land runway [X]'. "
                 f"8. VECTORING (Approach/Center ONLY): Instruct headings ('fly heading [XYZ]'), altitudes ('climb/descend and maintain [X] thousand'), and clear for approaches. "
                 f"Keep responses strictly in professional FAA/ICAO phraseology."
