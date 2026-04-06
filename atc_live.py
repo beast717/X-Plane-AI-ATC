@@ -75,6 +75,40 @@ async def run_atc_loop():
     squelch_sound = pygame.mixer.Sound("squelch.wav")
     chat_history = []
     
+    # 🌍 Cache for Runways & Airport Info to prevent spamming the APIs
+    location_cache = {}
+    runway_cache = {}
+
+    def get_runways_from_overpass(lat, lon, radius=5000):
+        # Round digits to cache the grid instead of firing for every meter moved
+        cache_key = f"{round(lat, 2)},{round(lon, 2)}"
+        if cache_key in runway_cache:
+            return runway_cache[cache_key]
+
+        print("📡 Querying real-world aviation databases for active runways...")
+        overpass_url = "https://overpass-api.de/api/interpreter"
+        query = f"""
+        [out:json];
+        way["aeroway"="runway"](around:{radius},{lat},{lon});
+        out tags;
+        """
+        try:
+            r = requests.get(overpass_url, params={'data': query}, timeout=3.0)
+            data = r.json()
+            runways = []
+            for element in data.get('elements', []):
+                tags = element.get('tags', {})
+                ref = tags.get('ref')
+                if ref and len(ref) <= 7: # Make sure it's actually a runway like "11/29" or "09"
+                    runways.append(ref)
+            
+            # Remove duplicates and clean up
+            runways = list(set([r.replace(" ", "") for r in runways]))
+            runway_cache[cache_key] = runways
+            return runways
+        except Exception:
+            return []
+
     while True:
         # 1. RECORD YOUR VOICE (Push-to-Talk) or wait for ATIS
         action = await record_audio_ptt()
@@ -87,6 +121,7 @@ async def run_atc_loop():
         wind_dir, wind_spd_kts, altim_inhg, qnh_mb = 0, 0, 29.92, 1013
         tail = "UNKNOWN"
         heading, airspeed = 0.0, 0.0
+        squawk_code = 1200
         
         try:
             with xpc.XPlaneConnect() as xp:
@@ -114,6 +149,14 @@ async def run_atc_loop():
                     on_ground = agl_meters < 15.0
                 except:
                     on_ground = True
+                    
+                # 4. Transponder (Squawk Code)
+                try:
+                    squawk_raw = xp.getDREF("sim/cockpit/radios/transponder_code")
+                    if squawk_raw:
+                        squawk_code = int(squawk_raw[0])
+                except:
+                    pass
                     
                 # 3. Weather Data (These often change names in X-Plane 12)
                 try:
@@ -173,7 +216,11 @@ async def run_atc_loop():
 
         # Format location context for the AI
         location_name = "Local Area"
+        active_runways = []
         if lat != 0.0 and lon != 0.0:
+            active_runways = get_runways_from_overpass(lat, lon)
+            
+            # Use Nominatim for the City Name
             try:
                 headers = {'User-Agent': 'XPlane-AI-ATC/1.0'}
                 # Extremely fast HTTP call to get the town/city name from coordinates
@@ -221,7 +268,9 @@ async def run_atc_loop():
             print(f"ATC Thinking (Role: {atc_role} on {com1_mhz:.3f} MHz)...")
             system_prompt = (
                 f"You are a professional Air Traffic Controller acting at {location_name}. "
-                f"The pilot's tail number is {tail} (If 'UNKNOWN', use their stated callsign). Aircraft state: {alt_ft:.0f}ft MSL, Heading {heading:03.0f}, Speed {airspeed:.0f} kts, currently {location_status}. "
+                f"The pilot's tail number is {tail} (If 'UNKNOWN', use their stated callsign). "
+                f"Aircraft state: {alt_ft:.0f}ft MSL, Heading {heading:03.0f}, Speed {airspeed:.0f} kts, currently {location_status}, Squawk {squawk_code}. "
+                f"Real reported runways at this physical location: {', '.join(active_runways) if active_runways else 'Unknown (assign a generic runway like 27)'}. "
                 f"\n--- RADIO FREQUENCY LOGIC --- \n"
                 f"The pilot is transmitting on {com1_mhz:.3f} MHz. I am explicitly assigning you the role of {atc_role}. "
                 f"CRITICAL ROLE AUTHORITIES:\n"
@@ -234,12 +283,14 @@ async def run_atc_loop():
                 f"CURRENT WEATHER: {weather_context} "
                 f"\n--- RULES ---\n"
                 f"CRITICAL: DO NOT anticipate the pilot's next request. If the pilot reads something back correctly, ONLY acknowledge it ('Roger', 'Readback correct'). DO NOT give the next clearance. "
-                f"1. IFR CLEARANCE (Clearance/Ground ONLY): Provide clearance limit, route, initial altitude, real-world departure frequency, squawk code, AND expected departure runway. "
-                f"2. READBACKS: Acknowledge briefly and naturally (e.g., 'Roger'). VARY YOUR RESPONSES. Do not repeatedly say 'readback correct'. Do not add any new instructions. "
-                f"3. PUSHBACK/START (Ground ONLY): Approve push/start and advise which way to face. "
-                f"4. TAXI (Ground ONLY): Assign a single runway, realistic taxiways, give Altimeter/QNH, and state 'hold short of runway [X]'. "
-                f"5. TAKEOFF/LANDING (Tower ONLY): Provide wind conditions and state 'cleared for takeoff/land runway [X]'. "
-                f"6. VECTORING (Approach/Center ONLY): Instruct headings ('fly heading [XYZ]'), altitudes ('climb/descend and maintain [X] thousand'), and clear for approaches. "
+                f"1. SQUAWK CODES: If the pilot is airborne but their transponder squawk is 1200 or wildly incorrect, you MUST instruct them to 'squawk [4-digit code]' or 'recycle transponder' before giving further instructions. "
+                f"2. RUNWAYS: Whenever assigning a taxi, takeoff, or landing clearance, STRICTLY ONLY USE the real reported runways listed above. Do not invent runways. "
+                f"3. IFR CLEARANCE (Clearance/Ground ONLY): Provide clearance limit, route, initial altitude, real-world departure frequency, squawk code, AND expected departure runway. "
+                f"4. READBACKS: Acknowledge briefly and naturally (e.g., 'Roger'). VARY YOUR RESPONSES. Do not repeatedly say 'readback correct'. Do not add any new instructions. "
+                f"5. PUSHBACK/START (Ground ONLY): Approve push/start and advise which way to face. "
+                f"6. TAXI (Ground ONLY): Assign a single real runway, realistic taxiways, give Altimeter/QNH, and state 'hold short of runway [X]'. "
+                f"7. TAKEOFF/LANDING (Tower ONLY): Provide wind conditions and state 'cleared for takeoff/land runway [X]'. "
+                f"8. VECTORING (Approach/Center ONLY): Instruct headings ('fly heading [XYZ]'), altitudes ('climb/descend and maintain [X] thousand'), and clear for approaches. "
                 f"Keep responses strictly in professional FAA/ICAO phraseology."
             )
 
