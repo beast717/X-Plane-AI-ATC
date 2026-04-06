@@ -62,14 +62,29 @@ async def record_audio_ptt(fs=44100):
 
 def generate_squelch():
     """Generates a realistic radio mic click/squelch sound using numpy."""
-    if not os.path.exists("squelch.wav"):
-        fs = 44100
-        duration = 0.15 # 150 milliseconds of static
-        t = np.linspace(0, duration, int(fs * duration), endpoint=False)
-        envelope = np.exp(-15 * t)
-        noise = np.random.normal(0, 0.5, len(t)) * envelope
-        audio = np.int16(noise / np.max(np.abs(noise)) * 32767)
-        write("squelch.wav", fs, audio)
+    fs = 44100
+    duration = 0.12 # 120 milliseconds of squelch
+    t = np.linspace(0, duration, int(fs * duration), endpoint=False)
+    
+    # 1. Background static noise
+    noise = np.random.normal(0, 0.8, len(t))
+    noise_env = np.ones_like(t)
+    noise_env[:int(fs * 0.01)] = np.linspace(0, 1, int(fs * 0.01)) # Fast attack
+    noise_env[-int(fs * 0.03):] = np.linspace(1, 0, int(fs * 0.03)) # Fast decay
+    
+    # 2. Synthesize mechanical mic clicks at the beginning and end
+    click1_env = np.exp(-500 * t)
+    click1 = np.sin(2 * np.pi * 2000 * t) * click1_env
+    
+    click2_env = np.exp(-400 * t[::-1])
+    click2 = np.sin(2 * np.pi * 1200 * t) * click2_env
+    
+    # Mix together: clicks are louder, noise is in the background
+    signal = (noise * noise_env * 0.4) + (click1 * 0.8) + (click2 * 0.5)
+    
+    # Normalize and lower volume slightly so it doesn't blow out eardrums
+    audio = np.int16(signal / np.max(np.abs(signal)) * 24000)
+    write("radio_click.wav", fs, audio)
 
 def generate_heavy_static():
     """Generates pure radio static when out of range."""
@@ -95,7 +110,7 @@ async def run_atc_loop():
     pygame.mixer.init()
     generate_squelch()
     generate_heavy_static()
-    squelch_sound = pygame.mixer.Sound("squelch.wav")
+    squelch_sound = pygame.mixer.Sound("radio_click.wav")
     heavy_static_sound = pygame.mixer.Sound("heavy_static.wav")
     chat_history = []
     
@@ -391,14 +406,14 @@ async def run_atc_loop():
             flight_plan_context = f"Pilot's filed IFR plan: Destination {simbrief_data['destination']}, Route: {simbrief_data['route']}, Initial FL: {simbrief_data['altitude']}."
 
         # Strictly enforce ATC role to stop the AI from guessing
-        atc_role = "APPROACH/CENTER" # Default for anything high frequency (126.0+)
+        atc_role = "APPROACH/CENTER" # Default for anything high frequency
         if 118.0 <= com1_mhz <= 121.5:
             atc_role = "TOWER"
         elif 121.6 <= com1_mhz <= 121.95: # Sola Ground is 121.90
             atc_role = "GROUND"
         elif 122.0 <= com1_mhz <= 123.05:
             atc_role = "UNICOM" # UNICOM (untowered)
-        elif 123.05 < com1_mhz <= 126.0: # Sola Clearance is 121.925 or 125+ in standard airspace
+        elif 123.05 < com1_mhz < 124.0: # Clearance Delivery
             atc_role = "CLEARANCE DELIVERY"
 
         # VHF RADIO PHYSICS (Line of Sight & Range Checks)
@@ -439,6 +454,7 @@ async def run_atc_loop():
                 f"Generate a short, realistic FAA ATIS broadcast. "
                 f"Start with '{location_name} Airport, information {atis_letter}...'. "
                 f"End with '...advise on initial contact, you have information {atis_letter}.' "
+                f"CRITICAL: Spell out the ATIS letter using the NATO phonetic alphabet (e.g., if it is A, write out 'Alpha'). "
                 f"Do not include any pleasantries or conversational filler. Output the standard script only."
             )
             messages = [{"role": "system", "content": system_prompt}]
@@ -447,31 +463,36 @@ async def run_atc_loop():
             system_prompt = (
                 f"You are a professional Air Traffic Controller acting at {location_name}. "
                 f"The pilot's tail number is {tail} (If 'UNKNOWN', use their stated callsign). "
-                f"Aircraft state: {alt_ft:.0f}ft MSL, Heading {heading:03.0f}, Speed {airspeed:.0f} kts, currently {location_status}, Squawk {squawk_code}. {nav_info}"
+                f"Aircraft state: {alt_ft:.0f}ft MSL, Heading {heading:03.0f}, Speed {airspeed:.0f} kts, currently {location_status}, Squawk {squawk_code}. {nav_info}\n"
                 f"Real reported runways at this physical location: {', '.join(active_runways) if active_runways else 'Unknown (assign a generic runway like 27)'}. "
                 f"Real reported taxiways at this physical location: {', '.join(active_taxiways) if active_taxiways else 'Unknown (invent realistic taxiways like A, B, C)'}. "
                 f"\n--- RADIO FREQUENCY LOGIC & HANDOFFS --- \n"
                 f"The pilot is transmitting on {com1_mhz:.3f} MHz. I am explicitly assigning you the role of {atc_role}. "
                 f"Available Frequencies for {location_name}: Clearance (121.92), Ground (121.9), Tower (118.5), Approach/Departure (124.5), Center (126.0). "
                 f"CRITICAL ROLE AUTHORITIES & HANDOFF RULES:\n"
-                f"- If {atc_role} is UNICOM: You are NOT ATC. You CANNOT give IFR clearances, pushback, taxi, takeoff, or landing clearances. Tell the pilot they are on UNICOM and must tune to the correct ATC frequency for {location_name}.\n"
-                f"- If {atc_role} is GROUND: You can give IFR, pushback, and taxi clearances. You CANNOT give takeoff or landing clearances. When the pilot reaches the runway holding point, explicitly tell them 'Contact Tower on 118.5'.\n"
-                f"- If {atc_role} is TOWER: You can give takeoff and landing clearances. You CANNOT give IFR or pushback clearances. When the pilot is airborne and climbing out, explicitly tell them 'Contact Departure on 124.5'. Upon landing and exiting the runway, tell them 'Contact Ground on 121.9'.\n"
-                f"- If {atc_role} is APPROACH/CENTER: Provide radar vectoring (assign headings and altitudes) and approach clearances. Use the pilot's current heading ({heading:03.0f}) and airspeed ({airspeed:.0f} kts) to formulate instructions. Monitor ILS tracking: if the pilot is drifting, issue a correction. When the pilot is established on final approach, explicitly tell them 'Contact Tower on 118.5'.\n"
-                f"If the pilot asks for a clearance outside your {atc_role} authority, STRICTLY DENY IT and tell them to contact the proper frequency.\n"
+                f"- If {atc_role} is UNICOM: You are NOT ATC. Tell the pilot they are on UNICOM and must tune to the correct ATC frequency for {location_name}.\n"
+                f"- If {atc_role} is GROUND: You can give IFR, pushback, and taxi clearances. When the pilot is ready for departure at the runway, explicitly tell them 'Contact Tower on 118.5'.\n"
+                f"- If {atc_role} is TOWER: You can give takeoff and landing clearances. When the pilot is airborne and climbing out, explicitly tell them 'Contact Departure on 124.5'. Upon landing and exiting the runway, tell them 'Contact Ground on 121.9'.\n"
+                f"- If {atc_role} is APPROACH/CENTER: Provide radar vectoring and approach clearances. Use the pilot's current heading ({heading:03.0f}) and airspeed ({airspeed:.0f} kts). \n"
+                f"If the pilot asks for a clearance outside your {atc_role} authority, STRICTLY DENY IT.\n"
                 f"\n--- FLIGHT PLAN & WEATHER ---\n"
                 f"CURRENT WEATHER: {weather_context} "
                 f"\nSIMBRIEF FLIGHT PLAN: {flight_plan_context}\n"
                 f"\n--- RULES ---\n"
-                f"CRITICAL: DO NOT anticipate the pilot's next request. If the pilot reads something back correctly, ONLY acknowledge it ('Roger', 'Readback correct'). DO NOT give the next clearance. "
-                f"1. SQUAWK CODES: If the pilot is airborne but their transponder squawk is 1200 or wildly incorrect, you MUST instruct them to 'squawk [4-digit code]' or 'recycle transponder' before giving further instructions. "
-                f"2. RUNWAYS: Whenever assigning a taxi, takeoff, or landing clearance, STRICTLY ONLY USE the real reported runways listed above. Do not invent runways. "
-                f"3. IFR CLEARANCE (Clearance/Ground ONLY): Base the clearance ON THE SIMBRIEF FLIGHT PLAN. Provide clearance limit (Destination), route, initial altitude, real-world departure frequency, squawk code, AND expected departure runway. "
-                f"4. READBACKS: Acknowledge briefly and naturally (e.g., 'Roger'). VARY YOUR RESPONSES. Do not repeatedly say 'readback correct'. Do not add any new instructions. "
-                f"5. PUSHBACK/START (Ground ONLY): Approve push/start and advise which way to face. "
-                f"6. TAXI (Ground ONLY): Assign a single real runway, realistic routing using the real reported taxiways, give Altimeter/QNH, and state 'hold short of runway [X]'. "
-                f"7. TAKEOFF/LANDING (Tower ONLY): Provide wind conditions and state 'cleared for takeoff/land runway [X]'. "
-                f"8. VECTORING (Approach/Center ONLY): Instruct headings ('fly heading [XYZ]'), altitudes ('climb/descend and maintain [X] thousand'), and clear for approaches. "
+                f"CRITICAL: 1. ONE INSTRUCTION AT A TIME. Respond only to what the pilot is explicitly requesting right now. If they ask for pushback, ONLY give pushback, DO NOT give taxi. NEVER ask the pilot if they are ready for the next step. NEVER give taxi instructions until the pilot explicitly says 'ready for taxi'.\n"
+                f"CRITICAL: 2. ACKNOWLEDGING READBACKS: If the pilot is reading back a clearance, you MUST NOT give any further instructions automatically. DO NOT add handoffs or taxi clearances to an acknowledgement. NEVER use 'Roger' to acknowledge a clearance readback. Use strict ICAO/FAA phraseology (e.g., '[Callsign], readback correct', or just state their '[Callsign]').\n"
+                f"CRITICAL: 3. DO NOT MICROMANAGE. Maintain a professional, detached ATC tone. Avoid redundant phrasing like 'Clearance for [Callsign]'. Just say '[Callsign], cleared to...'. Simply provide the clearance or vector. Just say 'Taxi via [route] hold short runway [X]'.\n"
+                f"CRITICAL: 4. HANDOFFS MUST BE TIMED CORRECTLY AND NEVER COMBINED WITH CLEARANCES:\n"
+                f"  - Ground to Tower: DO NOT handoff during taxi clearance. ONLY instruct 'Contact Tower on 118.5' when the pilot explicitly reports holding short of the runway.\n"
+                f"  - Tower to Departure: DO NOT handoff during takeoff clearance. ONLY instruct 'Contact Departure on 124.5' when the aircraft is explicitly reported AIRBORNE or location_status is AIRBORNE.\n"
+                f"CRITICAL: 5. DO NOT CONTRADICT SIMBRIEF. If {atc_role} is APPROACH/CENTER and aircraft is climbing, clear them up to their cruise altitude of {simbrief_data['altitude'] if simbrief_data else 'unknown'}.\n"
+                f"CRITICAL: 6. RUNWAY CONSISTENCY. Maintain a strictly consistent active runway state. Review the chat history! The runway you assign for taxi, holding short, and takeoff MUST identically match the 'expect runway' you assigned in the initial IFR clearance.\n"
+                f"CRITICAL: 7. PHONETIC ALPHABET. ALWAYS use the NATO phonetic alphabet for single letters (e.g., say 'Taxiway Alpha', not 'Taxiway A'; 'Information Bravo', not 'Information B').\n"
+                f"8. SQUAWK CODES: If squawk is 1200 instruct 'squawk [4-digit code]'.\n"
+                f"9. IFR CLEARANCE (Clearance/Ground ONLY): Assign a lower INITIAL altitude (e.g., 5000 or 7000), NOT cruise. Provide clearance limit, route (DO NOT read the entire route string; read only the first waypoint/SID, then state 'then as filed'), initial altitude, departure frequency (which is 124.5 for Departure, NEVER 121.92), squawk code, and expected runway. Do NOT give pushback or taxi instructions here.\n"
+                f"10. TRANSCRIPTION: Ignore minor speech transcription artifacts ('10-20', hyphens, '121.94', weird callsign glitches like '81777'). Use the pilot's stated callsign from the transcription.\n"
+                f"11. VECTORING (Approach/Center ONLY): Instruct headings ('fly heading [XYZ]'), altitudes ('climb/descend and maintain [X]'). Use 'climb via SID' when appropriate.\n"
+                f"12. ALTITUDE PHRASEOLOGY: For altitudes 18,000 feet and above, you MUST use 'Flight Level' (e.g., 'climb and maintain Flight Level 290'). For altitudes below 18,000 feet, use thousands and hundreds (e.g., 'climb and maintain one two thousand').\n"
                 f"Keep responses strictly in professional FAA/ICAO phraseology."
             )
 
