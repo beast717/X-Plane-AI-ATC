@@ -13,6 +13,7 @@ import numpy as np
 import requests
 import time
 import math
+import csv
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Tuple
@@ -78,7 +79,110 @@ class FlightStateTracker:
             print(f"[✈️ Flight Phase Transition: {self.phase.name} → {new_phase.name}]")
             self.phase = new_phase
             self.instructions_given_this_phase.clear()
-    
+
+# --- DYNAMIC FREQUENCY MANAGER ---
+class DynamicFrequencyManager:
+    """Fetches real-world airport frequencies for accurate ATC role assignments."""
+    def __init__(self):
+        self.airports_file = "airports.csv"
+        self.frequencies_file = "airport-frequencies.csv"
+        self.airports = []
+        self.frequencies = {}
+        
+    def load_data(self):
+        print("🌍 Loading global airport frequency database...")
+        # Download datasets if missing
+        if not os.path.exists(self.airports_file):
+            print("   -> Downloading airports.csv...")
+            r = requests.get("https://ourairports.com/data/airports.csv", timeout=10.0)
+            with open(self.airports_file, "wb") as f:
+                f.write(r.content)
+        if not os.path.exists(self.frequencies_file):
+            print("   -> Downloading airport-frequencies.csv...")
+            r = requests.get("https://ourairports.com/data/airport-frequencies.csv", timeout=10.0)
+            with open(self.frequencies_file, "wb") as f:
+                f.write(r.content)
+                
+        # Load medium/large airports to save memory
+        try:
+            with open(self.airports_file, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if row['type'] in ['large_airport', 'medium_airport', 'small_airport']:
+                        try:
+                            self.airports.append({
+                                'ident': row['ident'],
+                                'name': row['name'],
+                                'lat': float(row['latitude_deg']),
+                                'lon': float(row['longitude_deg'])
+                            })
+                        except ValueError:
+                            pass
+                        
+            # Map frequencies to ATC roles
+            with open(self.frequencies_file, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    ident = row['airport_ident']
+                    if ident not in self.frequencies:
+                        self.frequencies[ident] = {}
+                    
+                    try:
+                        mhz = round(float(row['frequency_mhz']), 3)
+                        role_str = row['type'].upper()
+                        # Map raw data type to AI Prompt Roles
+                        mapped_role = "APPROACH/CENTER"  # Default generic blanket
+                        if role_str in ['TWR', 'CTAF', 'UNIC', 'UNICOM']:
+                            mapped_role = "TOWER"
+                        elif role_str in ['GND', 'RAMP', 'SMC']:
+                            mapped_role = "GROUND"
+                        elif role_str in ['DEL', 'CLD', 'CD']:
+                            mapped_role = "CLEARANCE DELIVERY"
+                        elif role_str in ['ATIS', 'AWOS', 'ASOS', 'AFIS']:
+                            mapped_role = "ATIS"
+                        self.frequencies[ident][mhz] = mapped_role
+                    except ValueError:
+                        pass
+            print(f"✅ Loaded frequencies for {len(self.frequencies)} airports worldwide.")
+        except Exception as e:
+            print(f"[Frequency DB Error: {e}] - Falling back to hardcoded bands.")
+
+    def get_atc_role(self, lat, lon, target_mhz, in_air=False):
+        closest_ident = None
+        min_dist = float('inf')
+        
+        # Find closest airport quickly using bounding box filtering before haversine
+        for ap in self.airports:
+            if abs(ap['lat'] - lat) < 1.0 and abs(ap['lon'] - lon) < 1.0:
+                d = haversine_nm(lat, lon, ap['lat'], ap['lon'])
+                if d < min_dist:
+                    min_dist = d
+                    closest_ident = ap['ident']
+                    
+        # Check closest airport for matching frequency
+        if closest_ident and closest_ident in self.frequencies:
+            freqs = self.frequencies[closest_ident]
+            # Check within 0.005 tolerance for simulator 8.33kHz rounding quirks
+            for mhz, role in freqs.items():
+                if abs(mhz - target_mhz) <= 0.006:
+                    return role
+        
+        # --- Fallback to hardcoded bands if exact freq not found in DB ---
+        role = "APPROACH/CENTER"
+        if 121.6 <= target_mhz <= 121.95:
+            role = "GROUND"
+        elif 122.0 <= target_mhz <= 123.05:
+            role = "UNICOM"
+        elif 123.05 < target_mhz < 124.0:
+            role = "CLEARANCE DELIVERY"
+        elif 118.0 <= target_mhz <= 121.5:
+            # If airborne, Approach/Center takes over local tower freq
+            if in_air:
+                role = "APPROACH/CENTER"
+            else:
+                role = "TOWER"
+        return role
+
     def extract_and_commit_llm_assignment(self, llm_response: str):
         """
         Parse LLM response and extract/commit any newly assigned values.
@@ -303,6 +407,9 @@ async def run_atc_loop():
     chat_history = []
     flight_tracker = FlightStateTracker()
     last_com1_mhz = -1.0  # Track frequency changes to reset context
+
+    freq_manager = DynamicFrequencyManager()
+    freq_manager.load_data()
 
     # 🌍 Caches to prevent spamming external APIs
     location_cache = {}
@@ -671,15 +778,13 @@ async def run_atc_loop():
                 flight_plan_context += f" | Distance to dest: {dest_dist:.1f} NM. Bearing to dest: {dest_brg:03.0f} degrees."
 
         # ATC Role from frequency
-        atc_role = "APPROACH/CENTER"
-        if 118.0 <= com1_mhz <= 121.5:
-            atc_role = "TOWER"
-        elif 121.6 <= com1_mhz <= 121.95:
-            atc_role = "GROUND"
-        elif 122.0 <= com1_mhz <= 123.05:
-            atc_role = "UNICOM"
-        elif 123.05 < com1_mhz < 124.0:
-            atc_role = "CLEARANCE DELIVERY"
+        in_air = not on_ground and flight_tracker.phase in [FlightPhase.CLIMB, FlightPhase.CRUISE, FlightPhase.DESCENT, FlightPhase.APPROACH, FlightPhase.TAKEOFF]
+        atc_role = freq_manager.get_atc_role(lat, lon, com1_mhz, in_air=in_air)
+        
+        # Immediate climb phase flip protection
+        if flight_tracker.phase == FlightPhase.TAKEOFF and not on_ground and agl_meters > 500:
+            flight_tracker.update_phase(FlightPhase.CLIMB)
+            atc_role = freq_manager.get_atc_role(lat, lon, com1_mhz, in_air=True)
 
         # VHF Radio Line-of-Sight Range Check
         # FIX: Lock station to aircraft position only when on the ground tuning a local freq
@@ -742,7 +847,7 @@ async def run_atc_loop():
                 flight_tracker.update_phase(FlightPhase.HOLD_SHORT)
 
             # --- FAILSAFE PHASE UPDATES BASED ON TELEMETRY ---
-            if not on_ground and airspeed > 60 and flight_tracker.phase in [FlightPhase.PREFLIGHT, FlightPhase.PUSHBACK, FlightPhase.TAXI, FlightPhase.HOLD_SHORT]:
+            if not on_ground and airspeed > 60 and flight_tracker.phase in [FlightPhase.PREFLIGHT, FlightPhase.PUSHBACK, FlightPhase.TAXI, FlightPhase.HOLD_SHORT, FlightPhase.TAKEOFF]:
                 print("\n[✈️ Failsafe Transition: Aircraft is airborne, forcing CLIMB phase]")
                 flight_tracker.update_phase(FlightPhase.CLIMB)
             
