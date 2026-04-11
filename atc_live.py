@@ -226,6 +226,18 @@ class DynamicFrequencyManager:
             role = "APPROACH/CENTER" if in_air else "TOWER"
         return role
 
+    def get_nearest_airport(self, lat, lon):
+        closest_ap = None
+        min_dist = float('inf')
+
+        for ap in self.airports:
+            if abs(ap['lat'] - lat) < 1.0 and abs(ap['lon'] - lon) < 1.0:
+                d = haversine_nm(lat, lon, ap['lat'], ap['lon'])
+                if d < min_dist:
+                    min_dist = d
+                    closest_ap = ap
+        return closest_ap
+
     def get_nearest_frequencies(self, lat, lon):
         """Returns a formatted string of real frequencies for the nearest airport."""
         closest_ident = None
@@ -607,7 +619,8 @@ def generate_atc_system_prompt(
     altimeter_phrase: str,
     emergency: EmergencyStatus,
     station_distance_nm: float,
-    local_freqs: str
+    local_freqs: str,
+    intercept_heading: Optional[int]
 ) -> str:
     """Generate highly realistic ATC system prompt with proper phraseology."""
 
@@ -684,11 +697,11 @@ CRITICAL RULES:
 - Example: "Descend to flight level two four zero, expect approach runway two seven"
 - Transfer to Tower frequency when appropriate""",
 
-        FlightPhase.APPROACH: """Pilot is on approach.
+        FlightPhase.APPROACH: f"""Pilot is on approach.
 CRITICAL RULES:
-- Issue approach clearance: "Cleared [type] approach runway two seven"
+- Issue approach clearance: "Cleared [type] approach runway {best_runway if best_runway else 'two seven'}"
 - Provide vectors if needed (PMS/DMS format)
-- Example vector: "Turn left heading zero niner zero, intercept localizer"
+- MUST USE THIS EXACT VECTOR FOR INTERCEPT: "Fly heading {f'{intercept_heading:03d}' if intercept_heading else '...'}, intercept localizer"
 - Monitor glideslope intercept
 - When established: "continue, report outer marker" OR "continue, tower advise no traffic"
 - Transfer to Tower when runway is assured""",
@@ -1175,11 +1188,29 @@ async def run_atc_loop():
         active_runways = []
         best_active_runway = None
         active_taxiways = []
+        intercept_heading = None
+        
         if lat != 0.0 and lon != 0.0:
             active_runways = get_runways_from_overpass(lat, lon)
             best_active_runway = get_best_runway(active_runways, wind_dir)
             active_taxiways = get_taxiways_from_overpass(lat, lon)
             location_name = get_location_name(lat, lon)
+
+            # --- PRECISION VECTORING CALCULATION ---
+            if best_active_runway:
+                match = re.match(r"(\d+)", best_active_runway)
+                if match:
+                    rw_hdg = int(match.group(1)) * 10
+                    nearest_ap = freq_manager.get_nearest_airport(lat, lon)
+                    if nearest_ap:
+                        brg = calculate_bearing(lat, lon, nearest_ap['lat'], nearest_ap['lon'])
+                        hdg1 = (rw_hdg - 30) % 360
+                        hdg2 = (rw_hdg + 30) % 360
+                        if hdg1 == 0: hdg1 = 360
+                        if hdg2 == 0: hdg2 = 360
+                        diff1 = abs((hdg1 - brg + 180) % 360 - 180)
+                        diff2 = abs((hdg2 - brg + 180) % 360 - 180)
+                        intercept_heading = int(hdg1 if diff1 < diff2 else hdg2)
 
         location_status = "ON THE GROUND" if on_ground else "AIRBORNE"
 
@@ -1298,7 +1329,7 @@ If general call, respond briefly and direct to appropriate frequency."""
                 weather_context, best_active_runway, active_taxiways,
                 simbrief_data, nav_info, squawk_code, tail,
                 is_faa_region, altimeter_phrase, emergency, station_distance_nm,
-                local_freqs
+                local_freqs, intercept_heading
             )
             chat_history.append({"role": "user", "content": user_text})
 
