@@ -5,7 +5,7 @@ import atc_live
 
 # --- FAKE X-PLANE STATE ---
 state = {
-    "freq_hz": 12800,       # Start on 128.00 (ATIS)
+    "freq_hz": 126005,       # Start on 128.00 (ATIS)
     "lat": 58.8767,         # ENZV
     "lon": 5.6378,
     "alt_m": 9.0,
@@ -48,7 +48,7 @@ async def mock_record_audio(squelch=None, fs=44100):
     while True:
         # Check if tuned to ATIS
         com1_mhz = state["freq_hz"] / 100.0
-        if abs(com1_mhz - 128.000) < 0.01:
+        if abs(com1_mhz - 126.005) < 0.01:
             return "ATIS"
         
         # Check if text was typed in the console
@@ -84,7 +84,7 @@ def control_panel():
     print("="*60)
     print("COMMANDS:")
     print("  say <text> -> E.g., say Sola Delivery, Scandinavian 123...")
-    print("  f <freq>   -> Tune COM1 (e.g., f 121.9)")
+    print("  f <freq>   -> Tune COM1 (e.g., f 121.755)")
     print("  a <alt>    -> Set Altitude in feet (e.g., a 5000)")
     print("  sq <code>  -> Set Squawk (e.g., sq 4321)")
     print("  takeoff    -> Simulate takeoff")

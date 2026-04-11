@@ -1,3 +1,7 @@
+"""
+ATC Live - Ultra-Realistic Air Traffic Control Simulator
+Enhanced version with maximum realism improvements
+"""
 import asyncio
 import xpc
 from groq import Groq
@@ -7,8 +11,8 @@ import os
 from dotenv import load_dotenv
 import sounddevice as sd
 from scipy.io.wavfile import write
-from scipy.signal import butter, sosfilt
-import keyboard
+from scipy.signal import butter, sosfilt, iirfilter, lfilter
+from scipy.fft import fft, ifft
 import numpy as np
 import requests
 import time
@@ -16,69 +20,110 @@ import math
 import csv
 from enum import Enum
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, List
 import re
+import struct
 
 load_dotenv()
 
 # --- CONFIGURATION ---
-# It is recommended to use environment variables instead of hardcoding credentials:
-# export GROQ_API_KEY="your_key_here"
-# export SIMBRIEF_USERNAME="your_username_here"
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "YOUR_GROQ_API_KEY_HERE")
-SIMBRIEF_USERNAME = os.environ.get("SIMBRIEF_USERNAME", "")  # Leave blank to disable SimBrief
+SIMBRIEF_USERNAME = os.environ.get("SIMBRIEF_USERNAME", "")
 client = Groq(api_key=GROQ_API_KEY)
 FILENAME = "mic_input.wav"
 
-# --- AUDIO RADIO EFFECT SETTINGS ---
-RADIO_LOWPASS_HZ = 3000   # VHF voice top cutoff
-RADIO_HIGHPASS_HZ = 300   # VHF voice bottom cutoff
-RADIO_NOISE_LEVEL = 0.008 # Subtle noise under voice (0 to disable)
+# --- ENHANCED AUDIO CONFIGURATION ---
+SAMPLE_RATE = 44100
+RADIO_LOWPASS_HZ = 2800      # Realistic VHF channel bandwidth
+RADIO_HIGHPASS_HZ = 400      # Voice presence
+RADIO_NOISE_LEVEL = 0.006    # Subtle channel noise
+AM_MODULATION_DEPTH = 0.85  # Simulate AM transmission
+
+# Pre-emphasis/de-emphasis for more authentic radio sound
+PRE_EMPHASIS = 1.5          # High-frequency boost before transmission
+DE_EMPHASIS = 0.7           # High-frequency cut after reception
 
 # --- FLIGHT STATE ENUMS ---
 class FlightPhase(Enum):
-    """Explicit flight phase tracking for phase-aware prompting."""
-    PREFLIGHT = "preflight"          # Before startup
-    STARTUP = "startup"              # Engine start request
-    PUSHBACK = "pushback"            # Pushback clearance given
-    TAXI = "taxi"                    # Actively taxiing
-    HOLD_SHORT = "hold_short"        # Holding short of runway
-    TAKEOFF = "takeoff"              # Takeoff clearance given / airborne
-    CLIMB = "climb"                  # Climbing to cruise
-    CRUISE = "cruise"                # Cruise phase
-    DESCENT = "descent"              # Descending
-    APPROACH = "approach"            # On approach
-    FINAL = "final"                  # On final approach
-    GO_AROUND = "go_around"          # Missed approach / go-around
-    LANDED = "landed"                # Touched down
-    ROLLOUT = "rollout"              # Landing rollout
-    TAXI_IN = "taxi_in"              # Taxiing to parking
+    """Detailed flight phase tracking for phase-aware prompting."""
+    PREFLIGHT = "preflight"
+    STARTUP = "startup"
+    PUSHBACK = "pushback"
+    TAXI = "taxi"
+    HOLD_SHORT = "hold_short"
+    TAKEOFF = "takeoff"
+    CLIMB = "climb"
+    CRUISE = "cruise"
+    DESCENT = "descent"
+    APPROACH = "approach"
+    FINAL = "final"
+    GO_AROUND = "go_around"
+    LANDED = "landed"
+    ROLLOUT = "rollout"
+    TAXI_IN = "taxi_in"
 
-# --- FLIGHT STATE TRACKER ---
+class AircraftCategory(Enum):
+    """Wake turbulence categories for realistic separation."""
+    SUPER = "Super (A380, AN-225)"
+    HEAVY = "Heavy (B747, B777, A350)"
+    LARGE = "Large (B737, A320, E190)"
+    MEDIUM = "Medium (CJ1, Phenom 100)"
+    SMALL = "Small (C172, PA-28)"
+
+class EmergencyStatus(Enum):
+    """Emergency priority levels."""
+    NONE = "none"
+    URGENT = "urgent"          # 7600 - Radio failure
+    INTERCEPT = "intercept"    # 7500 - Hijack
+    EMERGENCY = "emergency"    # 7700 - General emergency
+
+# --- ENHANCED FLIGHT STATE TRACKER ---
 @dataclass
 class FlightStateTracker:
     """
-    Persistent state machine that survives frequency changes and pilot interactions.
-    Tracks assigned values to prevent hallucination and ensure runway/squawk consistency.
+    Enhanced state machine with detailed clearance tracking.
+    Prevents hallucination and ensures runway/squawk consistency.
     """
     phase: FlightPhase = FlightPhase.PREFLIGHT
-    
-    # Assigned clearance values (set once, never re-issued without pilot request)
-    assigned_runway: Optional[str] = None          # e.g., "27R"
-    assigned_altitude: Optional[str] = None        # e.g., "FL250" or "3000"
-    assigned_heading: Optional[float] = None       # magnetic heading in degrees
-    assigned_speed: Optional[float] = None         # in knots
-    assigned_squawk: Optional[int] = None          # 4-digit code, e.g., 5546
-    
-    # Tracking what instructions have been given in this phase
-    instructions_given_this_phase: list = field(default_factory=list)
-    
+    emergency: EmergencyStatus = EmergencyStatus.NONE
+
+    # Assigned clearances (set once, never changed without pilot request)
+    assigned_runway: Optional[str] = None
+    assigned_sid: Optional[str] = None          # Standard Instrument Departure
+    assigned_star: Optional[str] = None          # Standard Terminal Arrival
+    assigned_altitude: Optional[str] = None
+    assigned_climb_violation_alt: Optional[int] = None
+    assigned_heading: Optional[float] = None
+    assigned_speed: Optional[float] = None
+    assigned_squawk: Optional[int] = None
+    assigned_transponder_mode: str = "C"        # C mode (Mode S)
+
+    # IFR Route details
+    cleared_route: Optional[str] = None
+    clearance_limit: Optional[str] = None
+
+    # Taxi clearance
+    taxi_instructions: List[str] = field(default_factory=list)
+
+    # Track what has been read back correctly
+    readback_verified: Dict[str, bool] = field(default_factory=dict)
+
+    # Instructions this phase
+    instructions_given_this_phase: List[str] = field(default_factory=list)
+
+    # Aircraft category (for wake turbulence)
+    aircraft_category: AircraftCategory = AircraftCategory.LARGE
+
+    # Previous controller for handoff tracking
+    previous_controller: Optional[str] = None
+
     def update_phase(self, new_phase: FlightPhase):
-        """Transition to a new flight phase and clear phase-specific history."""
+        """Transition to a new flight phase."""
         if self.phase != new_phase:
             print(f"[✈️ Flight Phase Transition: {self.phase.name} → {new_phase.name}]")
             self.phase = new_phase
             self.instructions_given_this_phase.clear()
+            self.readback_verified.clear()
 
 # --- DYNAMIC FREQUENCY MANAGER ---
 class DynamicFrequencyManager:
@@ -88,10 +133,11 @@ class DynamicFrequencyManager:
         self.frequencies_file = "airport-frequencies.csv"
         self.airports = []
         self.frequencies = {}
-        
+        self._metar_cache = {}         # NEW: Cache METAR data
+        self._atis_cache = {}           # NEW: Cache ATIS data
+
     def load_data(self):
         print("🌍 Loading global airport frequency database...")
-        # Download datasets if missing
         if not os.path.exists(self.airports_file):
             print("   -> Downloading airports.csv...")
             r = requests.get("https://ourairports.com/data/airports.csv", timeout=10.0)
@@ -102,8 +148,7 @@ class DynamicFrequencyManager:
             r = requests.get("https://ourairports.com/data/airport-frequencies.csv", timeout=10.0)
             with open(self.frequencies_file, "wb") as f:
                 f.write(r.content)
-                
-        # Load medium/large airports to save memory
+
         try:
             with open(self.airports_file, "r", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
@@ -114,32 +159,23 @@ class DynamicFrequencyManager:
                                 'ident': row['ident'],
                                 'name': row['name'],
                                 'lat': float(row['latitude_deg']),
-                                'lon': float(row['longitude_deg'])
+                                'lon': float(row['longitude_deg']),
+                                'elevation_ft': int(row.get('elevation_ft', 0) or 0)
                             })
                         except ValueError:
                             pass
-                        
-            # Map frequencies to ATC roles
+
             with open(self.frequencies_file, "r", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
                     ident = row['airport_ident']
                     if ident not in self.frequencies:
                         self.frequencies[ident] = {}
-                    
+
                     try:
                         mhz = round(float(row['frequency_mhz']), 3)
                         role_str = row['type'].upper()
-                        # Map raw data type to AI Prompt Roles
-                        mapped_role = "APPROACH/CENTER"  # Default generic blanket
-                        if role_str in ['TWR', 'CTAF', 'UNIC', 'UNICOM']:
-                            mapped_role = "TOWER"
-                        elif role_str in ['GND', 'RAMP', 'SMC']:
-                            mapped_role = "GROUND"
-                        elif role_str in ['DEL', 'CLD', 'CD']:
-                            mapped_role = "CLEARANCE DELIVERY"
-                        elif role_str in ['ATIS', 'AWOS', 'ASOS', 'AFIS']:
-                            mapped_role = "ATIS"
+                        mapped_role = self._map_frequency_role(role_str)
                         self.frequencies[ident][mhz] = mapped_role
                     except ValueError:
                         pass
@@ -147,27 +183,38 @@ class DynamicFrequencyManager:
         except Exception as e:
             print(f"[Frequency DB Error: {e}] - Falling back to hardcoded bands.")
 
+    def _map_frequency_role(self, role_str: str) -> str:
+        """Map frequency type to ATC role."""
+        if role_str in ['TWR', 'CTAF', 'UNIC', 'UNICOM']:
+            return "TOWER"
+        elif role_str in ['GND', 'RAMP', 'SMC']:
+            return "GROUND"
+        elif role_str in ['DEL', 'CLD', 'CD']:
+            return "CLEARANCE DELIVERY"
+        elif role_str in ['ATIS', 'AWOS', 'ASOS', 'AFIS']:
+            return "ATIS"
+        elif role_str in ['APP', 'DEP', 'CTR', 'Radar']:
+            return "APPROACH/CENTER"
+        return "APPROACH/CENTER"
+
     def get_atc_role(self, lat, lon, target_mhz, in_air=False):
         closest_ident = None
         min_dist = float('inf')
-        
-        # Find closest airport quickly using bounding box filtering before haversine
+
         for ap in self.airports:
             if abs(ap['lat'] - lat) < 1.0 and abs(ap['lon'] - lon) < 1.0:
                 d = haversine_nm(lat, lon, ap['lat'], ap['lon'])
                 if d < min_dist:
                     min_dist = d
                     closest_ident = ap['ident']
-                    
-        # Check closest airport for matching frequency
+
         if closest_ident and closest_ident in self.frequencies:
             freqs = self.frequencies[closest_ident]
-            # Check within 0.005 tolerance for simulator 8.33kHz rounding quirks
             for mhz, role in freqs.items():
                 if abs(mhz - target_mhz) <= 0.006:
                     return role
-        
-        # --- Fallback to hardcoded bands if exact freq not found in DB ---
+
+        # Fallback to frequency bands
         role = "APPROACH/CENTER"
         if 121.6 <= target_mhz <= 121.95:
             role = "GROUND"
@@ -176,83 +223,149 @@ class DynamicFrequencyManager:
         elif 123.05 < target_mhz < 124.0:
             role = "CLEARANCE DELIVERY"
         elif 118.0 <= target_mhz <= 121.5:
-            # If airborne, Approach/Center takes over local tower freq
-            if in_air:
-                role = "APPROACH/CENTER"
-            else:
-                role = "TOWER"
+            role = "APPROACH/CENTER" if in_air else "TOWER"
         return role
 
+    def get_nearest_frequencies(self, lat, lon):
+        """Returns a formatted string of real frequencies for the nearest airport."""
+        closest_ident = None
+        min_dist = float('inf')
+
+        for ap in self.airports:
+            if abs(ap['lat'] - lat) < 1.0 and abs(ap['lon'] - lon) < 1.0:
+                d = haversine_nm(lat, lon, ap['lat'], ap['lon'])
+                if d < min_dist:
+                    min_dist = d
+                    closest_ident = ap['ident']
+
+        freq_context = ""
+        if closest_ident and closest_ident in self.frequencies:
+            freqs = self.frequencies[closest_ident]
+            # Reverse map: {Role: Frequency}
+            role_to_freq = {}
+            for mhz, role in freqs.items():
+                if role not in role_to_freq: # Keep first matching per role
+                    role_to_freq[role] = mhz
+            
+            # Create a readable context string for the AI prompt
+            freq_context = ", ".join(f"{role.capitalize()}: {mhz:.3f} MHz" for role, mhz in role_to_freq.items())
+            
+        return freq_context if freq_context else "Frequencies: Ground 121.9, Tower 118.1, Approach 121.5"
+
     def extract_and_commit_llm_assignment(self, llm_response: str):
-        """
-        Parse LLM response and extract/commit any newly assigned values.
-        E.g., if LLM says "squawk 5546", extract 5546 and update state.
-        """
-        # Extract squawk code (4 digits)
+        """Parse LLM response and extract/commit any newly assigned values."""
+        # Extract squawk code
         squawk_match = re.search(r'\bsquawk\s+(\d{4})\b', llm_response, re.IGNORECASE)
         if squawk_match:
-            self.assigned_squawk = int(squawk_match.group(1))
-            
-        # Extract runway (e.g., "27", "27R", "27L", "27C") - be careful not to catch "runway heading" or similar
-        runway_match = re.search(r'\b(?:runway|rwy)\s+([0-3]\d[LRC]?)\b', llm_response, re.IGNORECASE)
-        if runway_match:
-            self.assigned_runway = runway_match.group(1).upper()
-            
-        # Extract altitude clearance
-        alt_match = re.search(r'\b(?:climb to|descend to|maintain|Flight Level)\s+([FL]*[\d,]+)\b', 
-                            llm_response, re.IGNORECASE)
-        if alt_match:
-            self.assigned_altitude = alt_match.group(1).replace(",", "")
+            return int(squawk_match.group(1))
+        return None
 
-        # Infer phase updates from ATC response keywords
-        text = llm_response.lower()
-        if "cleared to" in text and "route" in text and "altitude" in text:
-            self.update_phase(FlightPhase.PREFLIGHT)
-        elif "pushback and start approved" in text or "pushback approved" in text:
-            self.update_phase(FlightPhase.PUSHBACK)
-        elif "taxi to holding point" in text or "taxi via" in text:
-            self.update_phase(FlightPhase.TAXI)
-        elif "cleared for takeoff" in text:
-            self.update_phase(FlightPhase.TAKEOFF)
-        elif "cleared to land" in text:
-            self.update_phase(FlightPhase.FINAL)
+# --- ENHANCED AUDIO PROCESSING ---
+def apply_pre_emphasis(audio: np.ndarray, fs: int, coefficient: float = 0.95) -> np.ndarray:
+    """Apply pre-emphasis filter for transmission clarity."""
+    b = [1.0, -coefficient]
+    a = [1.0]
+    return lfilter(b, a, audio)
 
+def apply_de_emphasis(audio: np.ndarray, fs: int, coefficient: float = 0.95) -> np.ndarray:
+    """Apply de-emphasis filter for receiver authenticity."""
+    b = [1.0]
+    a = [1.0, -coefficient]
+    return lfilter(b, a, audio)
 
-def apply_radio_effect(audio_path: str, out_path: str, fs: int = 44100):
+def apply_am_modulation(audio: np.ndarray, depth: float = 0.85) -> np.ndarray:
+    """Simulate AM modulation with carrier."""
+    carrier = 1.0 - depth  # DC offset acts as carrier
+    return carrier + audio * depth
+
+def apply_radio_effect(audio_path: str, out_path: str, fs: int = SAMPLE_RATE,
+                      signal_strength: float = 1.0, distance_nm: float = 0.0):
     """
-    Post-processes a WAV file to sound like a VHF radio transmission:
-    - Bandpass filter (300–3000 Hz)
-    - Subtle background noise under voice
-    - Light normalization
+    Enhanced radio effect chain for maximum realism:
+    1. Pre-emphasis (transmission)
+    2. Bandpass filter (VHF channel)
+    3. AM modulation simulation
+    4. Signal strength attenuation
+    5. Atmospheric fading based on distance
+    6. Channel noise
+    7. De-emphasis (reception)
+    8. Compression/limiting
     """
     try:
         from scipy.io.wavfile import read as wav_read
         sample_rate, data = wav_read(audio_path)
 
-        # Convert to float32 for processing
         if data.dtype == np.int16:
             audio = data.astype(np.float32) / 32768.0
         else:
             audio = data.astype(np.float32)
 
         if audio.ndim > 1:
-            audio = audio[:, 0]  # Use mono
+            audio = audio[:, 0]
 
-        # Bandpass filter: 300 Hz – 3000 Hz
+        # 1. Pre-emphasis for transmission realism
+        audio = apply_pre_emphasis(audio, sample_rate)
+
+        # 2. Bandpass filter (280Hz - 2800Hz for authentic VHF)
         sos_hp = butter(4, RADIO_HIGHPASS_HZ / (sample_rate / 2), btype='high', output='sos')
         sos_lp = butter(4, RADIO_LOWPASS_HZ / (sample_rate / 2), btype='low', output='sos')
         audio = sosfilt(sos_hp, audio)
         audio = sosfilt(sos_lp, audio)
 
-        # Add subtle static noise under the voice
+        # 3. AM modulation simulation
+        audio = apply_am_modulation(audio, AM_MODULATION_DEPTH)
+
+        # 4. Signal strength attenuation + distance-based fading
+        # Real VHF signal weakens with distance and has multipath fading
+        base_attenuation = 0.15 + (distance_nm / 200.0) * 0.3  # Progressive attenuation
+        signal_attenuation = max(0.05, 1.0 - base_attenuation) * signal_strength
+        audio = audio * signal_attenuation
+
+        # 5. Atmospheric noise modeling (pink noise characteristics)
         if RADIO_NOISE_LEVEL > 0:
-            noise = np.random.normal(0, RADIO_NOISE_LEVEL, len(audio))
+            # Generate noise with spectrum more realistic for VHF
+            noise = np.random.normal(0, RADIO_NOISE_LEVEL * 0.7, len(audio))
+            # Apply light low-pass to pinken the noise
+            sos_n = butter(2, 1500 / (sample_rate / 2), btype='low', output='sos')
+            noise = sosfilt(sos_n, noise)
             audio = audio + noise
 
-        # Normalize
+        # 6. Light intermodulation distortion for realism
+        if np.max(np.abs(audio)) > 0.5:
+            # Add subtle clipping character
+            audio = np.tanh(audio * 1.2) / 1.2
+
+        # 7. De-emphasis for receiver
+        audio = apply_de_emphasis(audio, sample_rate)
+
+        # 8. Compression for consistent loudness
+        # Soft knee compressor simulation
+        threshold = 0.6
+        ratio = 4.0
+        attack_coef = 0.95
+        release_coef = 0.98
+
+        envelope = np.abs(audio)
+        smoothed_env = np.zeros_like(envelope)
+        for i in range(len(envelope)):
+            if i == 0:
+                smoothed_env[i] = envelope[i]
+            else:
+                if envelope[i] > smoothed_env[i-1]:
+                    smoothed_env[i] = attack_coef * smoothed_env[i-1] + (1 - attack_coef) * envelope[i]
+                else:
+                    smoothed_env[i] = release_coef * smoothed_env[i-1] + (1 - release_coef) * envelope[i]
+
+        # Apply compression
+        gain_reduction = np.where(smoothed_env > threshold,
+                                   1.0 / ratio + (smoothed_env - threshold) / (smoothed_env * ratio),
+                                   1.0)
+        audio = audio * gain_reduction
+
+        # Final normalization
         peak = np.max(np.abs(audio))
         if peak > 0:
-            audio = audio / peak * 0.92
+            audio = audio / peak * 0.88
 
         write(out_path, sample_rate, (audio * 32767).astype(np.int16))
     except Exception as e:
@@ -261,94 +374,48 @@ def apply_radio_effect(audio_path: str, out_path: str, fs: int = 44100):
         shutil.copy(audio_path, out_path)
 
 
-async def record_audio_ptt(squelch=None, fs=44100):
-    print("\n[Hold '+' to talk to ATC, or tune to 128.000 for ATIS...]")
-
-    # Wait until PTT key is pressed OR frequency is ATIS
-    while not keyboard.is_pressed('+'):
-        try:
-            with xpc.XPlaneConnect() as xp:
-                try:
-                    com1_hz_val = xp.getDREF("sim/cockpit/radios/com1_freq_hz")[0]
-                    com1_mhz = com1_hz_val / 100.0
-                except Exception:
-                    com1_hz_val = xp.getDREF("sim/cockpit2/radios/actuators/com1_frequency_hz_833")[0]
-                    com1_mhz = com1_hz_val / 1000.0
-
-                if abs(com1_mhz - 128.000) < 0.01:
-                    return "ATIS"
-        except Exception:
-            pass
-
-        await asyncio.sleep(0.1)
-
-    if squelch:
-        squelch.play()
-
-    print("--- 🎙️ RECORDING (Release '+' to stop) ---")
-
-    recording = []
-
-    def callback(indata, frames, time, status):
-        recording.append(indata.copy())
-
-    with sd.InputStream(samplerate=fs, channels=1, callback=callback):
-        while keyboard.is_pressed('+'):
-            await asyncio.sleep(0.05)
-
-    if squelch:
-        squelch.play()
-
-    print("--- ☑️ RECORDING FINISHED ---")
-
-    if recording:
-        audio_data = np.concatenate(recording, axis=0)
-
-        # FIX: Reject recordings that are too short (accidental key tap)
-        duration_secs = len(audio_data) / fs
-        if duration_secs < 0.3:
-            print("[Recording too short, ignoring]")
-            return None
-
-        write(FILENAME, fs, audio_data)
-        return "PTT"
-    return None
-
-
-def generate_squelch():
-    """Generates a realistic radio mic click/squelch sound using numpy.
-    Only regenerates if the file doesn't already exist."""
+def generate_realistic_squelch():
+    """Generate a more realistic radio squelch click sequence."""
     if os.path.exists("radio_click.wav"):
         return
 
-    fs = 44100
-    duration = 0.12
+    fs = SAMPLE_RATE
+    duration = 0.15
     t = np.linspace(0, duration, int(fs * duration), endpoint=False)
 
-    noise = np.random.normal(0, 0.8, len(t))
-    noise_env = np.ones_like(t)
-    noise_env[:int(fs * 0.01)] = np.linspace(0, 1, int(fs * 0.01))
-    noise_env[-int(fs * 0.03):] = np.linspace(1, 0, int(fs * 0.03))
+    # Initial noise burst
+    noise = np.random.normal(0, 0.6, len(t))
 
-    click1_env = np.exp(-500 * t)
-    click1 = np.sin(2 * np.pi * 2000 * t) * click1_env
+    # Attack envelope
+    attack_env = np.exp(-200 * t)
 
-    click2_env = np.exp(-400 * t[::-1])
-    click2 = np.sin(2 * np.pi * 1200 * t) * click2_env
+    # Main click component
+    click = np.sin(2 * np.pi * 1800 * t) * np.exp(-400 * t)
+    click2 = np.sin(2 * np.pi * 2400 * t) * np.exp(-500 * t[::-1]) * 0.3
 
-    signal = (noise * noise_env * 0.4) + (click1 * 0.8) + (click2 * 0.5)
-    audio = np.int16(signal / np.max(np.abs(signal)) * 24000)
+    # Tail rumble
+    rumble = np.sin(2 * np.pi * 400 * t) * np.exp(-800 * t) * 0.2
+
+    signal = (noise[:len(t)] * attack_env * 0.3) + (click + click2 + rumble) * 0.7
+    audio = np.int16(signal / np.max(np.abs(signal)) * 22000)
     write("radio_click.wav", fs, audio)
 
 
 def generate_heavy_static():
-    """Generates pure radio static when out of range."""
+    """Generate more realistic channel noise/static."""
     if not os.path.exists("heavy_static.wav"):
-        fs = 44100
+        fs = SAMPLE_RATE
         duration = 1.5
+
+        # Create noise with realistic VHF characteristics
         t = np.linspace(0, duration, int(fs * duration), endpoint=False)
-        noise = np.random.normal(0, 0.3, len(t))
-        audio = np.int16(noise * 32767)
+        noise = np.random.normal(0, 0.25, len(t))
+
+        # Add some periodic components for "alive" static
+        for freq in [1200, 2400, 3600]:
+            noise += np.sin(2 * np.pi * freq * t) * 0.05 * np.random.random()
+
+        audio = np.int16(noise * 28000)
         write("heavy_static.wav", fs, audio)
 
 
@@ -372,64 +439,418 @@ def calculate_bearing(lat1, lon1, lat2, lon2):
     bearing = math.degrees(math.atan2(y, x))
     return (bearing + 360) % 360
 
+
 def get_best_runway(runways, wind_dir):
-    """Calculates the best runway based on headwind."""
+    """Calculates the best runway based on headwind component."""
     if not runways:
         return None
-        
+
     best_runway = runways[0]
-    smallest_diff = 180  # Max possible difference in degrees
+    smallest_diff = 180
 
     for rw in runways:
-        # Extract the number part of the runway (e.g., "16L" -> 16)
-        import re
         match = re.match(r"(\d+)", rw)
         if match:
             rw_hdg = int(match.group(1)) * 10
-            
-            # Calculate the angular difference between wind and runway heading
-            diff = abs((wind_dir - rw_hdg + 180) % 360 - 180)
-            
-            if diff < smallest_diff:
-                smallest_diff = diff
+            # Calculate crosswind component
+            crosswind = abs((wind_dir - rw_hdg + 180) % 360 - 180)
+
+            if crosswind < smallest_diff:
+                smallest_diff = crosswind
                 best_runway = rw
-                
+
     return best_runway
+
+
+def get_aircraft_category(icao_type: str) -> AircraftCategory:
+    """Determine wake turbulence category based on ICAO type."""
+    # Super heavy
+    if icao_type.upper() in ['A388', 'AN225']:
+        return AircraftCategory.SUPER
+    # Heavy
+    heavy_types = ['B744', 'B772', 'B773', 'B788', 'A332', 'A333', 'A335', 'A338', 'A339']
+    if icao_type.upper() in heavy_types:
+        return AircraftCategory.HEAVY
+    # Large
+    large_types = ['B738', 'B739', 'B37X', 'A320', 'A319', 'A321', 'A20N', 'A21N', 'E190', 'E195']
+    if icao_type.upper() in large_types:
+        return AircraftCategory.LARGE
+    return AircraftCategory.MEDIUM
+
+
+def calculate_min_separation(own_category: AircraftCategory, traffic_category: AircraftCategory,
+                            distance_nm: float, altitude_diff_ft: int) -> Tuple[bool, str]:
+    """Calculate if minimum separation is maintained."""
+    # Simplified wake turbulence separation minima
+    wake_minima = {
+        (AircraftCategory.SUPER, AircraftCategory.HEAVY): 8.0,
+        (AircraftCategory.SUPER, AircraftCategory.LARGE): 10.0,
+        (AircraftCategory.SUPER, AircraftCategory.MEDIUM): 12.0,
+        (AircraftCategory.HEAVY, AircraftCategory.LARGE): 5.0,
+        (AircraftCategory.HEAVY, AircraftCategory.MEDIUM): 6.0,
+        (AircraftCategory.LARGE, AircraftCategory.MEDIUM): 3.0,
+    }
+
+    min_distance = wake_minima.get((own_category, traffic_category), 3.0)
+
+    # Altitude-based separation (1000ft minimum for opposite direction)
+    alt_separation_ok = altitude_diff_ft >= 1000 if altitude_diff_ft < 1000 else True
+
+    # Radar separation (3NM horizontal or 1000ft vertical)
+    radar_ok = distance_nm >= 3.0 or altitude_diff_ft >= 1000
+
+    separation_ok = distance_nm >= min_distance and alt_separation_ok
+
+    if not separation_ok:
+        if distance_nm < 3.0:
+            return False, f"Traffic {distance_nm:.1f} miles, maintain separation"
+        return False, f"Wake turbulence separation required"
+    return True, "Clear"
+
+
+async def record_audio_ptt(squelch=None, fs=SAMPLE_RATE):
+    """Record audio with PTT, waits for ATIS check."""
+    print("\n[Hold '+' to talk to ATC, or tune to 121.5 for GUARD/emergency...]")
+
+    while not keyboard.is_pressed('+'):
+        try:
+            with xpc.XPlaneConnect() as xp:
+                try:
+                    com1_hz_val = xp.getDREF("sim/cockpit/radios/com1_freq_hz")[0]
+                    com1_mhz = com1_hz_val / 100.0
+                except Exception:
+                    com1_hz_val = xp.getDREF("sim/cockpit2/radios/actuators/com1_frequency_hz_833")[0]
+                    com1_mhz = com1_hz_val / 1000.0
+
+                if abs(com1_mhz - 128.000) < 0.01:
+                    return "ATIS"
+                if abs(com1_mhz - 121.5) < 0.01:
+                    return "GUARD"
+        except Exception:
+            pass
+
+        await asyncio.sleep(0.1)
+
+    if squelch:
+        squelch.play()
+
+    print("--- 🎙️ RECORDING ---")
+
+    recording = []
+
+    def callback(indata, frames, time, status):
+        recording.append(indata.copy())
+
+    with sd.InputStream(samplerate=fs, channels=1, callback=callback):
+        while keyboard.is_pressed('+'):
+            await asyncio.sleep(0.05)
+
+    if squelch:
+        squelch.play()
+
+    print("--- ☑️ RECORDING FINISHED ---")
+
+    if recording:
+        audio_data = np.concatenate(recording, axis=0)
+        duration_secs = len(audio_data) / fs
+        if duration_secs < 0.3:
+            print("[Recording too short, ignoring]")
+            return None
+
+        write(FILENAME, fs, audio_data)
+        return "PTT"
+    return None
+
+
+# --- ENHANCED AI PROMPTS FOR REALISM ---
+def generate_atis_system_prompt(location_name: str, weather_context: str,
+                                 active_runways: List[str], altimeter_phrase: str,
+                                 atis_type: str, atis_letter: str, notams: str = "") -> str:
+    """Generate highly realistic ATIS broadcast."""
+    return f"""You are the automated ATIS (Automatic Terminal Information Service) at {location_name}.
+
+CRITICAL RULES:
+1. Use EXACT format: "{location_name} Airport, information {atis_letter}."
+2. Spell the letter using NATO phonetic alphabet (Alpha, Bravo, Charlie, Delta, Echo, Foxtrot, Golf, Hotel, India, Juliett, Kilo, Lima, Mike, November, Oscar, Papa, Quebec, Romeo, Sierra, Tango, Uniform, Victor, Whiskey, X-ray, Yankee, Zulu)
+3. Translate ALL weather codes into spoken English - NEVER read raw METAR codes
+   - Wind: "15010KT" → "Wind one five zero at one zero knots"
+   - "15010G20KT" → "Wind one five zero at one zero knots gusting two zero"
+   - Visibility: "9999" → "Visibility one zero kilometers" or "Cavor one zero"
+   - "4500" → "Visibility four thousand five hundred meters"
+4. Use the correct pressure format: {altimeter_phrase}
+5. Active runways: {', '.join(active_runways) if active_runways else 'not available'}
+6. Include NOTAMs if provided: {notams}
+7. NEVER use pleasantries or filler phrases
+8. End exactly with: 'Advise on initial contact you have information {atis_letter}.'
+Example: 'JFK Airport information Bravo. Wind two seven zero at one five. Altimeter two niner niner two. ILS runway one niner left in use. Advise on initial contact you have information Bravo.'
+"""
+
+
+def generate_atc_system_prompt(
+    location_name: str,
+    flight_tracker: FlightStateTracker,
+    atc_role: str,
+    com1_mhz: float,
+    alt_ft: int,
+    heading: float,
+    airspeed: float,
+    vsi_fpm: float,
+    on_ground: bool,
+    weather_context: str,
+    best_runway: str,
+    taxiways: List[str],
+    simbrief_data: dict,
+    nav_info: str,
+    squawk_code: int,
+    tail: str,
+    is_faa_region: bool,
+    altimeter_phrase: str,
+    emergency: EmergencyStatus,
+    station_distance_nm: float,
+    local_freqs: str
+) -> str:
+    """Generate highly realistic ATC system prompt with proper phraseology."""
+
+    # Phase-specific instructions
+    phase_directives = {
+        FlightPhase.PREFLIGHT: f"""Pilot is PREFLIGHT at the gate. Issue clearance ONLY.
+CRITICAL RULES:
+- For IFR clearances, you MUST use CRAFT format: Clearance limit, Route, Altitude, Frequency, Transponder
+- MUST mention the assigned departure runway (Active runway: {best_runway}).
+- IMPORTANT: Use ACTUAL local frequencies for Departure handoffs. Local frequencies are: {local_freqs}
+- Example: "N12345, cleared to JFK via direct, departure runway {best_runway}, maintain five thousand, departure frequency [USE REAL FREQ], squawk four three two one"
+- Generate a RANDOM 4-digit Mode-S transponder code between 2000-6277 (never 1200 or 7000)
+- If pilot reads back correctly, say "Readback correct"
+- NEVER approve taxi, takeoff, or pushback during this phase
+- Acknowledge SimBrief flight plan if available""",
+
+        FlightPhase.PUSHBACK: """Pilot has requested pushback/startup.
+CRITICAL RULES:
+- Issue startup approval with pushback direction (e.g., "Face North")
+- Example: "Cessna foxtrot, pushback approved, face north, report ready to taxi"
+- Do NOT issue taxi clearance in same transmission - ONE STEP AT A TIME
+- If pilot reads back, acknowledge briefly with "Roger"
+- NEVER re-approve if already approved""",
+
+        FlightPhase.TAXI: """Pilot is taxiing.
+CRITICAL RULES:
+- Issue taxi clearance to holding point of assigned runway
+- Include taxiway designators using NATO phonetic alphabet
+- Include runway holding point and any restrictions
+- Example: "Taxi to holding point runway two seven via Alpha, Bravo, cross runway one niner"
+- If requesting to cross active runway, require position and hold
+- If pilot states holding short, instruct to contact Tower""",
+
+        FlightPhase.HOLD_SHORT: f"""Pilot is holding short of runway.
+CRITICAL RULES:
+- If at Ground frequency: instruct "Contact Tower" and provide REAL local tower frequency from: {local_freqs}
+- If at Tower frequency: issue takeoff clearance OR "Line up and wait"
+- Takeoff clearance MUST include wind: "Wind one eight zero at one zero, runway two seven, cleared for takeoff"
+- NEVER issue "line up and wait" and "cleared for takeoff" in same transmission
+- If landing traffic exists, issue "continue, traffic in sight" OR "hold short""",
+
+        FlightPhase.TAKEOFF: f"""Pilot is in takeoff roll OR just airborne.
+CRITICAL RULES:
+- If still rolling: "airspeed, call sign" (you may still cancel)
+- If airborne: hand off to Departure, provide frequency
+- Use REAL local frequencies for handoff: {local_freqs}
+- If climbing out of your airspace: "contact Departure [REAL FREQ]"
+- NEVER clear for approach during this phase""",
+
+        FlightPhase.CLIMB: f"""Pilot is climbing.
+CRITICAL RULES:
+- Assign altitude consistent with filed altitude or current traffic
+- Use proper phraseology: "Climb and maintain flight level [number]"
+- Provide heading vectors if needed for traffic or airspace
+- Handoff instructions MUST use real frequencies from: {{local_freqs}}
+- FL numbers are spoken as "flight level [three-two-zero]" for 320
+- When leaving your airspace: provide next controller frequency""",
+
+        FlightPhase.CRUISE: """Pilot is enroute at cruise altitude.
+CRITICAL RULES:
+- Monitor flight progress
+- Provide traffic advisories when required (5NM/1000ft separation)
+- Example traffic advisory: "Traffic, ten o'clock, forty miles, Boeing 737, climbing to flight level three five zero"
+- Issue frequency changes when appropriate
+- NEVER issue approach clearances during cruise""",
+
+        FlightPhase.DESCENT: """Pilot is descending.
+CRITICAL RULES:
+- Assign STAR (Standard Terminal Arrival) if applicable
+- Issue cross descent if pilot descends early
+- Provide approach clearance when: 50NM from destination or assigned fix
+- Example: "Descend to flight level two four zero, expect approach runway two seven"
+- Transfer to Tower frequency when appropriate""",
+
+        FlightPhase.APPROACH: """Pilot is on approach.
+CRITICAL RULES:
+- Issue approach clearance: "Cleared [type] approach runway two seven"
+- Provide vectors if needed (PMS/DMS format)
+- Example vector: "Turn left heading zero niner zero, intercept localizer"
+- Monitor glideslope intercept
+- When established: "continue, report outer marker" OR "continue, tower advise no traffic"
+- Transfer to Tower when runway is assured""",
+
+        FlightPhase.FINAL: """Pilot is on final approach.
+CRITICAL RULES:
+- Issue landing clearance: "Wind [direction] at [speed], runway [number], cleared to land"
+- If wind updated: "wind check [direction] at [speed], runway [number], cleared to land"
+- If go-around required: "go around, I say again, go around, [reason]"
+- Do NOT issue takeoff clearances when aircraft on final""",
+
+        FlightPhase.LANDED: """Aircraft has touched down.
+CRITICAL RULES:
+- Assign runway exit taxiway
+- Example: "turn left at Charlie, contact Ground [frequency]"
+- Do NOT issue taxi instructions yet""",
+
+        FlightPhase.TAXI_IN: """Pilot is taxiing to gate/parking.
+CRITICAL RULES:
+- Provide taxi clearance to stand
+- Example: "Taxi to stand Alpha one via Bravo, contact Ground"
+- Include apron entry instructions if applicable"""
+    }
+
+    phase_instruction = phase_directives.get(flight_tracker.phase, "Monitor and assist as needed.")
+
+    # Emergency handling
+    emergency_instruction = ""
+    if emergency == EmergencyStatus.EMERGENCY:
+        emergency_instruction = """
+!!! EMERGENCY TRAFFIC - PRIORITY OVER ALL OTHER TRAFFIC !!!
+Respond with extreme urgency:
+- "EMERGENCY TRAFFIC ROGER, I SAY AGAIN [clearance/instruction]"
+- Provide immediate vectors to nearest airport if requested
+- Alert emergency services
+- Clear all conflicting traffic"""
+    elif emergency == EmergencyStatus.URGENT:
+        emergency_instruction = """
+!!! RADIO FAILURE / URGENT TRAFFIC !!!
+If squawk 7600: Assume pilot has lost radio capability
+- Provide traffic advisories
+- Issue instructions assuming no readback
+- Monitor for pilot flashing landing lights or making standard turns"""
+    elif emergency == EmergencyStatus.INTERCEPT:
+        emergency_instruction = """
+!!! INTERCEPT SITUATION - SQUAWK 7500 !!!
+Contact supervisor immediately
+Follow intercept protocols"""
+
+    # Build SimBrief data block
+    simbrief_data_block = ""
+    if simbrief_data:
+        simbrief_data_block = f"""
+=== FLIGHT PLAN ===
+Destination: {simbrief_data['destination']}
+Route: {simbrief_data['route']}
+Initial Altitude: {simbrief_data['altitude']}"""
+
+    return f"""You are a professional, certified Air Traffic Controller acting as {atc_role} at {location_name}.
+
+=== AIRCRAFT IDENTIFICATION ===
+Tail number: {tail}
+Squawk: {squawk_code}
+Station distance: {station_distance_nm:.1f} NM
+{emergency_instruction}
+=== AIRCRAFT STATE ===
+Altitude: {alt_ft} feet MSL
+Heading: {heading:03.0f} degrees magnetic
+Airspeed: {airspeed:.0f} knots
+Vertical speed: {vsi_fpm:+.0f} feet per minute
+Position: {'ON THE GROUND' if on_ground else 'AIRBORNE'}
+{nav_info}
+
+=== CURRENT FLIGHT PHASE ===
+{flight_tracker.phase.name}
+
+=== ISSUED CLEARANCES (DO NOT REPEAT UNLESS PILOT ASKS) ===
+Assigned Runway: {flight_tracker.assigned_runway or 'Not yet assigned'}
+Assigned SID: {flight_tracker.assigned_sid or 'Not assigned'}
+Assigned STAR: {flight_tracker.assigned_star or 'Not assigned'}
+Assigned Altitude: {flight_tracker.assigned_altitude or 'Not assigned'}
+Assigned Squawk: {flight_tracker.assigned_squawk or squawk_code}
+Taxi Route: {', '.join(flight_tracker.taxi_instructions) if flight_tracker.taxi_instructions else 'Not assigned'}
+
+=== REAL-WORLD CONTEXT ===
+Weather: {weather_context}
+Active Runway: {best_runway if best_runway else 'Runway 27'}
+Available Taxiways: {', '.join(taxiways) if taxiways else 'Alpha, Bravo, Charlie'}
+Altimeter: {altimeter_phrase}
+{simbrief_data_block}
+
+=== CRITICAL OPERATIONAL RULES ===
+1. ROLE BOUNDARY: You are {atc_role}. Approve ONLY clearances within your authority.
+   - GROUND: Taxi, pushback, runway entry
+   - TOWER: Takeoff, landing, runway operations
+   - CLEARANCE DELIVERY: IFR/VFR clearances only
+   - APPROACH: Vectors, approach clearance, altitude assignments
+
+2. PHASE DIRECTIVE:
+{phase_instruction}
+
+3. SEPARATION RESPONSIBILITY:
+   - You are responsible for separation until handoff is acknowledged
+   - Issue "contact [next controller]" - pilot confirms with "changing"
+   - Do NOT issue conflicting clearances after handoff
+
+4. READBACK RULES:
+   - If pilot reads back clearance correctly: acknowledge "Roger" or callsign ONLY
+   - If readback incorrect: interrupt with correction
+   - In PREFLIGHT IFR clearances: MUST say "Readback correct" for correct readback
+   - Do NOT say "readback correct" in other phases - use "Roger" or callsign
+
+5. PHRASEOLOGY STANDARDS:
+   - Use NATO phonetic alphabet for letters (Alpha, Bravo, Charlie...)
+   - Numbers: 3→"tree", 9→"niner", 0→"zero", 7→"seven"
+   - Flight levels: 320 → "flight level three two zero"
+   - Runway numbers: 27 → "two seven", 01 → "zero one"
+   - Altimeter: "altimeter two niner niner two" (FAA) or "QNH one zero one three" (ICAO)
+   - Compass directions: 090→"zero niner zero"
+
+6. TIMING & CONCISENESS:
+   - Keep transmissions under 30 seconds
+   - Group information efficiently
+   - Do NOT use: "when ready", "call me back", "have a nice flight"
+   - One clearance per transmission (except in emergencies)
+
+7. TRAFFIC ADVISORIES:
+   - Provide when traffic within 10NM and 2000ft vertically
+   - Format: "[Direction] [Distance] miles, [Aircraft type or position], [Altitude or direction]"
+
+8. WORKLOAD MANAGEMENT:
+   - If frequency is busy, use "standby"
+   - If no contact after multiple calls, attempt contact at 2-minute intervals
+
+Respond using ONLY professional ICAO/FAA phraseology. Be concise but complete."""
 
 
 async def run_atc_loop():
     pygame.mixer.init()
-    generate_squelch()
+    generate_realistic_squelch()
     generate_heavy_static()
     squelch_sound = pygame.mixer.Sound("radio_click.wav")
     heavy_static_sound = pygame.mixer.Sound("heavy_static.wav")
 
     chat_history = []
     flight_tracker = FlightStateTracker()
-    last_com1_mhz = -1.0  # Track frequency changes to reset context
+    last_com1_mhz = -1.0
+    frequency_station_data = {}  # Track station info per frequency
 
     freq_manager = DynamicFrequencyManager()
     freq_manager.load_data()
 
-    # 🌍 Caches to prevent spamming external APIs
+    # Caches
     location_cache = {}
     runway_cache = {}
     taxiway_cache = {}
     metar_cache = {}
 
-    # 📻 Radio Line of Sight Tracker
-    # NOTE: lat/lon here should represent the AIRPORT/STATION position, not the aircraft.
-    # We approximate by locking the nearest airport centroid on first tune.
-    # The station is updated when frequency changes AND aircraft is near the ground
-    # (likely at an airport), otherwise it keeps the last known tower position.
-    active_station = {"mhz": 0.0, "lat": 0.0, "lon": 0.0}
-
-    # --- Persistent X-Plane connection ---
-    # We reuse a single connection object. If it drops, we reconnect on next iteration.
-    xp_conn = None
+    # SimBrief cache
+    simbrief_cache = None
+    last_simbrief_fetch = 0
 
     def get_xp():
-        """Returns a fresh XPlaneConnect context. Called per data-fetch block."""
+        """Returns a fresh XPlaneConnect context."""
         return xpc.XPlaneConnect()
 
     def get_real_metar(lat, lon):
@@ -437,7 +858,7 @@ async def run_atc_loop():
         if cache_key in metar_cache and (time.time() - metar_cache[cache_key]['time'] < 1800):
             return metar_cache[cache_key]['metar']
 
-        print("🌤️ Fetching real-world METAR for current location...")
+        print("🌤️ Fetching real-world METAR...")
         try:
             bbox = f"{lat-0.5},{lon-0.1},{lat+0.1},{lon+0.1}"
             url = f"https://aviationweather.gov/api/data/metar?format=json&bbox={bbox}"
@@ -452,14 +873,13 @@ async def run_atc_loop():
         return None
 
     def query_overpass_with_retries(query, timeout=5.0):
-        # Reduced endpoints and timeouts to fail fast gracefully without hanging the simulation
         endpoints = [
             "https://overpass.kumi.systems/api/interpreter",
             "https://lz4.overpass-api.de/api/interpreter",
             "https://overpass-api.de/api/interpreter"
         ]
         headers = {'User-Agent': 'atc_live/1.0'}
-        
+
         for url in endpoints:
             try:
                 r = requests.get(url, params={'data': query}, headers=headers, timeout=timeout)
@@ -481,7 +901,7 @@ async def run_atc_loop():
         out tags;
         """
         data = query_overpass_with_retries(query, timeout=5.0)
-        
+
         runways = []
         if data:
             for element in data.get('elements', []):
@@ -490,7 +910,7 @@ async def run_atc_loop():
                 if ref and len(ref) <= 7 and not ref.upper().endswith('H'):
                     runways.append(ref)
             runways = list(set([rw.replace(" ", "") for rw in runways]))
-        
+
         runway_cache[cache_key] = runways
         return runways
 
@@ -499,14 +919,14 @@ async def run_atc_loop():
         if cache_key in taxiway_cache:
             return taxiway_cache[cache_key]
 
-        print("🚖 Querying real-world aviation databases for active taxiways...")
+        print("🚖 Querying real-world aviation databases for taxiways...")
         query = f"""
         [out:json][timeout:2];
         way["aeroway"="taxiway"](around:{radius},{lat},{lon});
         out tags;
         """
         data = query_overpass_with_retries(query, timeout=5.0)
-        
+
         taxiways = []
         if data:
             for element in data.get('elements', []):
@@ -515,12 +935,11 @@ async def run_atc_loop():
                 if ref and len(ref) <= 3:
                     taxiways.append(ref.upper())
             taxiways = list(set(taxiways))
-        
+
         taxiway_cache[cache_key] = taxiways
         return taxiways
 
     def get_location_name(lat, lon):
-        """Reverse geocode lat/lon to a city/airport name. Cached to respect Nominatim ToS."""
         cache_key = f"{round(lat, 1)},{round(lon, 1)}"
         if cache_key in location_cache:
             return location_cache[cache_key]
@@ -542,9 +961,6 @@ async def run_atc_loop():
         location_cache[cache_key] = "Local Area"
         return "Local Area"
 
-    simbrief_cache = None
-    last_simbrief_fetch = 0
-
     def get_simbrief_flight_plan():
         nonlocal simbrief_cache, last_simbrief_fetch
         if not SIMBRIEF_USERNAME:
@@ -554,7 +970,7 @@ async def run_atc_loop():
             return simbrief_cache
 
         try:
-            print(f"📡 Fetching latest SimBrief flight plan for {SIMBRIEF_USERNAME}...")
+            print(f"📡 Fetching latest SimBrief flight plan...")
             url = f"https://www.simbrief.com/api/xml.fetcher.php?username={SIMBRIEF_USERNAME}&json=1"
             headers = {'User-Agent': 'XPlane-AI-ATC/1.0'}
             res = requests.get(url, headers=headers, timeout=5.0)
@@ -569,7 +985,6 @@ async def run_atc_loop():
                 route_full = data.get("general", {}).get("route", "Direct")
                 route_first_wp = route_full.split()[0] if route_full else "Direct"
 
-                # FIX: Variable was named 'alt' but referenced as 'alt_raw' — renamed correctly
                 alt_raw = data.get("general", {}).get("initial_altitude", "UNKNOWN")
                 alt = str(int(alt_raw) // 100) if (
                     isinstance(alt_raw, str) and alt_raw.isdigit() and int(alt_raw) >= 18000
@@ -584,18 +999,32 @@ async def run_atc_loop():
                     "altitude": alt
                 }
                 last_simbrief_fetch = time.time()
-                print(f"[✅ SimBrief Plan Loaded: {origin} to {dest} at FL{alt}]")
+                print(f"[✅ SimBrief Plan: {origin} to {dest} at FL{alt}]")
                 return simbrief_cache
         except Exception as e:
             print(f"[SimBrief error: {e}]")
         return None
 
+    def check_emergency_status(squawk_code: int) -> EmergencyStatus:
+        """Check for emergency squawk codes."""
+        if squawk_code == 7700:
+            return EmergencyStatus.EMERGENCY
+        elif squawk_code == 7600:
+            return EmergencyStatus.URGENT
+        elif squawk_code == 7500:
+            return EmergencyStatus.INTERCEPT
+        return EmergencyStatus.NONE
+
+    # Voice selection weights by role
+    male_voices = ["en-US-GuyNeural", "en-GB-RyanNeural", "en-US-ChristopherNeural",
+                   "en-US-EricNeural", "en-GB-ConnorNeural", "en-US-BrianNeural"]
+    female_voices = ["en-US-AriaNeural", "en-GB-SoniaNeural", "en-US-JennyNeural"]
+
     while True:
-        # 1. RECORD VOICE (Push-to-Talk) or wait for ATIS
         action = await record_audio_ptt(squelch_sound)
 
         if action is None:
-            continue  # Short recording or cancelled
+            continue
 
         # --- Pull X-Plane data ---
         on_ground = False
@@ -608,10 +1037,12 @@ async def run_atc_loop():
         squawk_code = 1200
         nav1_freq = 0.0
         nav1_hdef = 0.0
+        nav1_vdef = 0.0
+        aircraft_icao = "B738"
 
         try:
             with get_xp() as xp:
-                # 1. Positional Data
+                # Positional Data
                 try:
                     posi = xp.getPOSI(0)
                     lat, lon = posi[0], posi[1]
@@ -623,7 +1054,7 @@ async def run_atc_loop():
                 except Exception as e:
                     print(f"[Positional data error: {e}]")
 
-                # 2. Radar Data
+                # Radar Data
                 try:
                     heading_drefs = xp.getDREF("sim/flightmodel/position/mag_psi")
                     heading = heading_drefs[0] if heading_drefs else 0.0
@@ -633,7 +1064,7 @@ async def run_atc_loop():
                 except Exception as e:
                     print(f"[Radar data error: {e}]")
 
-                # 3. Ground Status
+                # Ground Status
                 try:
                     agl_meters = xp.getDREF("sim/flightmodel/position/y_agl")[0]
                     on_ground = agl_meters < 15.0
@@ -641,7 +1072,7 @@ async def run_atc_loop():
                     print(f"[Ground status error: {e}]")
                     on_ground = True
 
-                # 4. Transponder
+                # Transponder
                 try:
                     squawk_raw = xp.getDREF("sim/cockpit/radios/transponder_code")
                     if squawk_raw:
@@ -649,18 +1080,17 @@ async def run_atc_loop():
                 except Exception as e:
                     print(f"[Transponder error: {e}]")
 
-                # 4.5 ILS / NAV1 Tracking
+                # ILS / NAV1
                 try:
                     nav1_raw = xp.getDREF("sim/cockpit/radios/nav1_freq_hz")
                     if nav1_raw:
                         nav1_freq = nav1_raw[0] / 100.0
-                    nav1_def = xp.getDREF("sim/cockpit2/radios/indicators/nav1_hdef_dots_pilot")
-                    if nav1_def:
-                        nav1_hdef = nav1_def[0]
+                    nav1_hdef = xp.getDREF("sim/cockpit2/radios/indicators/nav1_hdef_dots_pilot")[0]
+                    nav1_vdef = xp.getDREF("sim/cockpit2/radios/indicators/nav1_vdef_dots_pilot")[0]
                 except Exception as e:
                     print(f"[NAV1 error: {e}]")
 
-                # 5. Weather Data
+                # Weather Data
                 try:
                     wind_dir_drefs = xp.getDREF("sim/weather/wind_direction_degs")
                     wind_dir = wind_dir_drefs[0] if wind_dir_drefs else 0
@@ -674,17 +1104,22 @@ async def run_atc_loop():
                 except Exception as e:
                     print(f"[Weather data error: {e}]")
 
-                # 6. Tail Number
+                # Tail Number and Aircraft Type
                 try:
                     tail_bytes = xp.getDREF("sim/aircraft/view/acf_tailnum")
                     if tail_bytes:
                         tail = "".join([chr(int(b)) for b in tail_bytes if b > 0]).strip()
                         if not tail:
                             tail = "UNKNOWN"
-                except Exception as e:
-                    print(f"[Tail number error: {e}]")
 
-                # 7. COM1 Frequency
+                    # Get aircraft ICAO type
+                    acf_type = xp.getDREF("sim/aircraft/acf_icao_code")
+                    if acf_type:
+                        aircraft_icao = "".join([chr(int(b)) for b in acf_type if b > 0]).strip()
+                except Exception as e:
+                    print(f"[Aircraft data error: {e}]")
+
+                # COM1 Frequency
                 try:
                     com1_hz_val = xp.getDREF("sim/cockpit/radios/com1_freq_hz")[0]
                     com1_mhz = com1_hz_val / 100.0
@@ -698,7 +1133,13 @@ async def run_atc_loop():
         except Exception as e:
             print(f"[X-Plane Connection Error] {e}")
 
-        # 2. TRANSCRIBE or bypass for ATIS
+        # Emergency status check
+        emergency = check_emergency_status(squawk_code)
+
+        # Aircraft category
+        flight_tracker.aircraft_category = get_aircraft_category(aircraft_icao)
+
+        # Transcription
         user_text = ""
         if action == "PTT":
             print("Transcribing...")
@@ -721,29 +1162,26 @@ async def run_atc_loop():
 
             print(f"You said: {user_text}")
 
-        # FIX: Reset chat history when the pilot changes frequency (new controller = fresh context)
+        # Frequency change detection
         if abs(com1_mhz - last_com1_mhz) > 0.01 and last_com1_mhz >= 0:
-            print(f"[📻 Frequency changed {last_com1_mhz:.3f} → {com1_mhz:.3f}. Resetting ATC context.]")
+            print(f"[📻 Frequency changed {last_com1_mhz:.3f} → {com1_mhz:.3f}. Resetting context.]")
             chat_history = []
         last_com1_mhz = com1_mhz
 
-        # Location context (cached)
+        # Location context
         location_name = "Local Area"
         active_runways = []
         best_active_runway = None
         active_taxiways = []
         if lat != 0.0 and lon != 0.0:
             active_runways = get_runways_from_overpass(lat, lon)
-            
-            # Determine the single best runway based on wind direction
             best_active_runway = get_best_runway(active_runways, wind_dir)
-            
             active_taxiways = get_taxiways_from_overpass(lat, lon)
             location_name = get_location_name(lat, lon)
 
         location_status = "ON THE GROUND" if on_ground else "AIRBORNE"
 
-        # FAA vs ICAO region detection
+        # Region detection
         is_faa_region = (-170 < lon < -50) and (15 < lat < 75)
         altimeter_phrase = f"altimeter {altim_inhg:.2f}" if is_faa_region else f"QNH {qnh_mb:.0f}"
         atis_type = "FAA" if is_faa_region else "ICAO"
@@ -753,50 +1191,58 @@ async def run_atc_loop():
             f"Wind {wind_dir:03.0f} at {wind_spd_kts:.0f} knots. {altimeter_phrase}."
         )
 
-        # ILS / NAV1 Tracking
+        # ILS / NAV1
         nav_info = ""
         if nav1_freq >= 108.0 and not on_ground:
             nav_info = f"NAV1 Tuned: {nav1_freq:.2f}."
             if nav1_hdef > 1.5:
-                nav_info += " (PILOT IS DRIFTING FAR LEFT OF THE LOCALIZER)"
+                nav_info += " (PILOT IS DRIFTING FAR LEFT)"
             elif nav1_hdef < -1.5:
-                nav_info += " (PILOT IS DRIFTING FAR RIGHT OF THE LOCALIZER)"
-            else:
-                nav_info += " (PILOT IS ESTABLISHED ON LOCALIZER)"
+                nav_info += " (PILOT IS DRIFTING FAR RIGHT)"
+            if nav1_vdef > 1.5:
+                nav_info += " (PILOT IS FAR BELOW GLIDESLOPE)"
+            elif nav1_vdef < -1.5:
+                nav_info += " (PILOT IS FAR ABOVE GLIDESLOPE)"
+            if abs(nav1_hdef) < 0.5 and abs(nav1_vdef) < 0.5:
+                nav_info += " (PILOT IS ESTABLISHED)"
 
         # SimBrief flight plan
         simbrief_data = get_simbrief_flight_plan()
-        flight_plan_context = "Pilot has NO IFR flight plan filed. Ask intentions."
+        flight_plan_context = "No IFR flight plan filed. Ask intentions."
         if simbrief_data:
             flight_plan_context = (
-                f"Pilot's filed IFR plan: Destination {simbrief_data['destination']}, "
+                f"IFR plan filed: {simbrief_data['origin']} to {simbrief_data['destination']}, "
                 f"Route: {simbrief_data['route']}, Initial FL: {simbrief_data['altitude']}."
             )
-            if simbrief_data.get('dest_lat') and simbrief_data.get('dest_lon') and not on_ground:
-                dest_dist = haversine_nm(lat, lon, simbrief_data['dest_lat'], simbrief_data['dest_lon'])
-                dest_brg = calculate_bearing(lat, lon, simbrief_data['dest_lat'], simbrief_data['dest_lon'])
-                flight_plan_context += f" | Distance to dest: {dest_dist:.1f} NM. Bearing to dest: {dest_brg:03.0f} degrees."
 
-        # ATC Role from frequency
-        in_air = not on_ground and flight_tracker.phase in [FlightPhase.CLIMB, FlightPhase.CRUISE, FlightPhase.DESCENT, FlightPhase.APPROACH, FlightPhase.TAKEOFF]
+        # ATC Role
+        in_air = not on_ground and flight_tracker.phase in [
+            FlightPhase.CLIMB, FlightPhase.CRUISE, FlightPhase.DESCENT,
+            FlightPhase.APPROACH, FlightPhase.TAKEOFF
+        ]
         atc_role = freq_manager.get_atc_role(lat, lon, com1_mhz, in_air=in_air)
-        
-        # Immediate climb phase flip protection
-        if flight_tracker.phase == FlightPhase.TAKEOFF and not on_ground and agl_meters > 500:
+
+        # Failsafe phase updates
+        if flight_tracker.phase == FlightPhase.TAKEOFF and not on_ground and alt_ft > 500:
             flight_tracker.update_phase(FlightPhase.CLIMB)
             atc_role = freq_manager.get_atc_role(lat, lon, com1_mhz, in_air=True)
 
-        # VHF Radio Line-of-Sight Range Check
-        # FIX: Lock station to aircraft position only when on the ground tuning a local freq
-        # (best approximation of actual tower/antenna position without a full airport database)
-        if abs(com1_mhz - active_station["mhz"]) > 0.01:
-            active_station["mhz"] = com1_mhz
-            # Only re-anchor station when on the ground (near the actual transmitter)
-            if on_ground:
-                active_station["lat"] = lat
-                active_station["lon"] = lon
+        if not on_ground and airspeed > 60 and flight_tracker.phase in [
+            FlightPhase.PREFLIGHT, FlightPhase.PUSHBACK, FlightPhase.TAXI,
+            FlightPhase.HOLD_SHORT, FlightPhase.TAKEOFF
+        ]:
+            print("\n[✈️ Failsafe: Aircraft airborne, transitioning to CLIMB]")
+            flight_tracker.update_phase(FlightPhase.CLIMB)
 
-        station_distance_nm = haversine_nm(lat, lon, active_station["lat"], active_station["lon"])
+        # VHF Radio Line-of-Sight
+        cache_key = f"{com1_mhz:.3f}"
+        if cache_key not in frequency_station_data:
+            frequency_station_data[cache_key] = {"lat": lat, "lon": lon}
+        elif on_ground:
+            frequency_station_data[cache_key] = {"lat": lat, "lon": lon}
+
+        station_data = frequency_station_data.get(cache_key, {"lat": lat, "lon": lon})
+        station_distance_nm = haversine_nm(lat, lon, station_data["lat"], station_data["lon"])
         max_los_nm = 1.23 * math.sqrt(max(alt_ft, 0)) + 10.0
 
         if atc_role in ["GROUND", "CLEARANCE DELIVERY"]:
@@ -807,115 +1253,59 @@ async def run_atc_loop():
             max_range = max_los_nm
 
         if station_distance_nm > max_range:
-            print(f"📻 [OUT OF RANGE] {station_distance_nm:.1f} NM away. Max range: {max_range:.1f} NM.")
+            print(f"📻 [OUT OF RANGE] {station_distance_nm:.1f} NM (max {max_range:.1f})")
             heavy_static_sound.play()
             await asyncio.sleep(1.5)
             continue
 
-        # 4. GET AI RESPONSE
-        # FIX: Use faster model for simple readbacks; full 70B for clearances
-        # FIX: Always use the smarter model for realism as per the plan
+        # Proactive phase updates
+        user_text_lower = user_text.lower()
+        if flight_tracker.phase == FlightPhase.PREFLIGHT and any(x in user_text_lower for x in ["push", "start"]):
+            flight_tracker.update_phase(FlightPhase.PUSHBACK)
+        elif flight_tracker.phase == FlightPhase.PUSHBACK and "taxi" in user_text_lower:
+            flight_tracker.update_phase(FlightPhase.TAXI)
+        elif flight_tracker.phase == FlightPhase.TAXI and any(x in user_text_lower for x in ["short", "runway"]):
+            flight_tracker.update_phase(FlightPhase.HOLD_SHORT)
+
+        # GET AI RESPONSE
         model_choice = "llama-3.3-70b-versatile"
 
         if action == "ATIS":
             print(f"📻 Generating ATIS for {location_name}...")
             atis_number = int((time.time() // 3600) % 26)
             atis_letter = chr(65 + atis_number)
-            system_prompt = (
-                f"You are the automated ATIS broadcaster at {location_name}. "
-                f"Current weather: {weather_context}. "
-                f"Active runways in use: {', '.join(active_runways) if active_runways else 'not determined'}. "
-                f"Generate a short, realistic {atis_type} standard ATIS broadcast. "
-                f"Start with '{location_name} Airport, information {atis_letter}...'. "
-                f"End with '...advise on initial contact, you have information {atis_letter}.' "
-                f"CRITICAL RULES: "
-                f"1. Spell out the ATIS letter using the NATO phonetic alphabet. "
-                f"2. You MUST translate raw METAR code into spoken English (e.g., read '15024G36KT' as 'wind one five zero at two four knots, gusting three six'). DO NOT read raw METAR strings like '092150Z'. "
-                f"3. Ensure you use the correct regional pressure setting ({altimeter_phrase}). "
-                f"4. Do not include any pleasantries."
+            system_prompt = generate_atis_system_prompt(
+                location_name, weather_context, active_runways,
+                altimeter_phrase, atis_type, atis_letter
             )
             messages = [{"role": "system", "content": system_prompt}]
+        elif action == "GUARD":
+            # You are monitoring guard frequency 121.5...
+            print("📻 GUARD frequency (121.5) - Emergency monitoring...")
+            system_prompt = """You are monitoring guard frequency 121.5.
+If this is an emergency call, provide immediate assistance with standard phraseology.
+If general call, respond briefly and direct to appropriate frequency."""
+            messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_text}]
         else:
-            print(f"ATC Thinking (Role: {atc_role} on {com1_mhz:.3f} MHz, model: {model_choice})...")
-            # --- PROACTIVE PHASE UPDATES BASED ON USER REQUEST ---
-            user_text_lower = user_text.lower()
-            if flight_tracker.phase == FlightPhase.PREFLIGHT and ("push" in user_text_lower or "start" in user_text_lower):
-                flight_tracker.update_phase(FlightPhase.PUSHBACK)
-            elif flight_tracker.phase == FlightPhase.PUSHBACK and ("taxi" in user_text_lower):
-                flight_tracker.update_phase(FlightPhase.TAXI)
-            elif flight_tracker.phase == FlightPhase.TAXI and ("short" in user_text_lower or "takeoff" in user_text_lower):
-                flight_tracker.update_phase(FlightPhase.HOLD_SHORT)
+            local_freqs = freq_manager.get_nearest_frequencies(lat, lon)
 
-            # --- FAILSAFE PHASE UPDATES BASED ON TELEMETRY ---
-            if not on_ground and airspeed > 60 and flight_tracker.phase in [FlightPhase.PREFLIGHT, FlightPhase.PUSHBACK, FlightPhase.TAXI, FlightPhase.HOLD_SHORT, FlightPhase.TAKEOFF]:
-                print("\n[✈️ Failsafe Transition: Aircraft is airborne, forcing CLIMB phase]")
-                flight_tracker.update_phase(FlightPhase.CLIMB)
-            
-            # --- DYNAMIC PHASE INSTRUCTIONS ---
-            phase_instructions = ""
-            if flight_tracker.phase == FlightPhase.PREFLIGHT:
-                phase_instructions = "Pilot is at the gate. Issue IFR/VFR clearance ONLY. Do NOT approve pushback or taxi yet. " \
-                    "For IFR clearances, you MUST follow standard structure: Clearance limit, Route (SID), Altitude, Departure Frequency, and Squawk. " \
-                    "If the pilot reads back the clearance correctly, YOU MUST confirm it by saying 'readback correct'. " \
-                    "CRITICAL: You MUST explicitly state the departure runway (e.g., 'Departure runway 18'). " \
-                    "CRITICAL: Generate a random 4-digit squawk code between 2000 and 7777. DO NOT use 1200 or 7000." \
-                    "CRITICAL: Do NOT list the clearance as 'Clearance limit: X, Route: Y'. Speak it naturally like a real controller. Example: 'Scandinavian 123, cleared to Oslo airport via the UPLE1G departure, runway 18. Climb and maintain 5000 feet, departure frequency 118.5, squawk 4321.'"
-            elif flight_tracker.phase == FlightPhase.PUSHBACK:
-                phase_instructions = "Pilot is in the pushback phase. If they request pushback, provide startup and pushback instructions (include a logical pushback direction like 'face North'). Do NOT add conversational padding like 'call me for taxi'. If they are just reading back your pushback clearance, simply confirm it briefly (e.g., 'Roger' or 'Callsign'). DO NOT re-approve pushback if already approved. Do NOT say 'readback correct' for pushback."
-            elif flight_tracker.phase == FlightPhase.TAXI:
-                phase_instructions = "Pilot is taxiing. Provide a logical taxi routing to the assigned runway holding point using multiple taxiways if necessary (e.g., 'Taxi via Alpha, Bravo, hold short runway 18'). Do NOT clear for takeoff. If the pilot states they are holding short, instruct them to contact Tower."
-            elif flight_tracker.phase == FlightPhase.HOLD_SHORT:
-                phase_instructions = "Pilot is holding short. If they are talking to Ground, instruct them to contact Tower. If they are talking to Tower, issue a takeoff clearance OR 'line up and wait'. A takeoff clearance MUST include the current wind (e.g., 'Wind 270 at 10, Runway 18, cleared for takeoff'). Do NOT re-issue the squawk code or altitude. Do NOT issue 'line up and wait' and 'cleared for takeoff' in the same transmission."
-            elif flight_tracker.phase == FlightPhase.TAKEOFF or flight_tracker.phase == FlightPhase.CLIMB:
-                phase_instructions = "Pilot is airborne. Hand off to Departure, or provide climb clearances and radar vectors."
-            elif flight_tracker.phase == FlightPhase.CRUISE:
-                phase_instructions = "Pilot is enroute. Provide traffic advisories, cruise altitude changes, or handoffs to next Center."
-            elif flight_tracker.phase == FlightPhase.DESCENT or flight_tracker.phase == FlightPhase.APPROACH:
-                phase_instructions = "Pilot is arriving. Provide descent clearances, approach vectors (PTA format), and hand off to Tower when established."
-            elif flight_tracker.phase == FlightPhase.FINAL:
-                phase_instructions = "Pilot is on final approach. Issue landing clearance and winds."
-            elif flight_tracker.phase == FlightPhase.ROLLOUT or flight_tracker.phase == FlightPhase.TAXI_IN:
-                phase_instructions = "Pilot has landed. Instruct them to exit the runway and contact Ground."
-
-            system_prompt = (
-                f"You are a professional Air Traffic Controller acting at {location_name}. "
-                f"The pilot's tail number is {tail} BUT if the pilot states a callsign, use it strictly. "
-                f"\n--- AIRCRAFT STATE ---\n"
-                f"{alt_ft:.0f}ft MSL, Heading {heading:03.0f}, Speed {airspeed:.0f} kts, VSI {vsi_fpm:.0f} fpm. {nav_info}\n"
-                f"Currently: {location_status}\n"
-                f"\n--- ISSUED CLEARANCES & HISTORY (DO NOT RE-ISSUE IF ALREADY GIVEN) ---\n"
-                f"Assigned Runway: {flight_tracker.assigned_runway or 'None'}\n"
-                f"Assigned Altitude: {flight_tracker.assigned_altitude or 'None'}\n"
-                f"Assigned Squawk: {flight_tracker.assigned_squawk or '1200'}\n"
-                f"Current Flight Phase: {flight_tracker.phase.name}\n"
-                f"Your Role: {atc_role} on {com1_mhz:.3f} MHz.\n"
-                f"\n--- REAL WORLD DATA ---\n"
-                f"Weather: {weather_context}\n"
-                f"Active Departure/Arrival Runway: {best_active_runway if best_active_runway else '27'}\n"
-                f"Reported Taxiways: {', '.join(active_taxiways) if active_taxiways else 'Invent realistic taxiways like A, B'}\n"
-                f"SimBrief Plan: {flight_plan_context}\n"
-                f"\n--- DYNAMIC ATC RULES ---\n"
-                f"1. YOU ARE {atc_role}. Only give clearances appropriate for your role. Deny others.\n"
-                f"2. CURRENT PHASE DIRECTIVE: {phase_instructions}\n"
-                f"3. PREVIOUS ASSIGNMENTS: If a runway/squawk/altitude is listed in 'ISSUED CLEARANCES' above, YOU MUST STRICTLY USE IT. Do NOT change runways once assigned. NEVER repeat the squawk code or initial altitude after the PREFLIGHT phase unless the pilot explicitly asks for it.\n"
-                f"4. ONE STEP AT A TIME: NEVER combine pushback and taxi clearances in the same transmission. If pilot requests pushback, ONLY approve pushback. NEVER add conversational padding like 'call for taxi when ready'.\n"
-                f"5. READBACKS: If the pilot correctly reads back an instruction, acknowledge it and DO NOT re-issue it. In the PREFLIGHT phase for IFR clearance readbacks, you MUST say 'Readback correct'. For ALL other phases, you MUST use extreme brevity and acknowledge with just 'Roger' or their callsign (do NOT say 'readback correct'). Accept partial readbacks as long as the core meaning is correct.\n"
-                f"6. HANDOFFS: Only issue handoffs when the aircraft is transitioning phases or leaving your airspace. Never bounce the pilot between frequencies (e.g., Center to Departure and back). Instruct them to contact Departure only when Airborne, Center when enroute, Tower when near the runway surface.\n"
-                f"7. IFR CLEARANCES: Use CRAFT format. DO NOT re-issue if the pilot is past PREFLIGHT phase.\n"
-                f"8. PHONETICS: Use NATO alphabet (e.g. Taxiway Alpha).\n"
-                f"9. PROFESSIONALISM: Extreme brevity is required. Do not use conversational padding like 'call me back for...', 'when ready...', or 'have a safe flight'. If an instruction changes, simply issue the new clearance directly (e.g., 'Climb and maintain flight level 330').\n"
-                f"Keep responses strictly in professional FAA/ICAO phraseology."
+            print(f"ATC Thinking ({atc_role} on {com1_mhz:.3f} MHz)...")
+            system_prompt = generate_atc_system_prompt(
+                location_name, flight_tracker, atc_role, com1_mhz,
+                alt_ft, heading, airspeed, vsi_fpm, on_ground,
+                weather_context, best_active_runway, active_taxiways,
+                simbrief_data, nav_info, squawk_code, tail,
+                is_faa_region, altimeter_phrase, emergency, station_distance_nm,
+                local_freqs
             )
-
             chat_history.append({"role": "user", "content": user_text})
 
-            # FIX: Trim history correctly — keep last 20 messages, not just pop one
             while len(chat_history) > 20:
                 chat_history.pop(0)
 
             messages = [{"role": "system", "content": system_prompt}] + chat_history
 
-        # FIX: Add timeout to LLM call to prevent sim freezing on slow API responses
+        # LLM call with timeout
         try:
             completion = await asyncio.wait_for(
                 asyncio.get_event_loop().run_in_executor(
@@ -940,55 +1330,62 @@ async def run_atc_loop():
 
         print(f"ATC: {response_text}")
 
-        # Voice selection: consistent per-frequency, role-weighted gender
-        # FIX: Skew voice gender by ATC role to better match real-world norms
-        male_voices = ["en-US-GuyNeural", "en-GB-RyanNeural", "en-US-ChristopherNeural", "en-US-EricNeural"]
-        female_voices = ["en-US-AriaNeural", "en-GB-SoniaNeural"]
-
+        # Voice selection - role-based with deterministic selection per frequency
         if action == "ATIS":
-            tts_voice = "en-US-JennyNeural"
+            tts_voice = "en-US-JennyNeural"  # Female for ATIS
         elif atc_role in ["APPROACH/CENTER", "TOWER"]:
-            # Radar/Tower: mostly male
             all_voices = male_voices + female_voices[:1]
             tts_voice = all_voices[int(com1_mhz * 1000) % len(all_voices)]
         else:
-            # Ground/Clearance: mixed
             all_voices = male_voices + female_voices
             tts_voice = all_voices[int(com1_mhz * 1000) % len(all_voices)]
 
-        # Save response to history ONLY if it was an ATC interaction
+        # Save to history
         if action == "PTT":
             chat_history.append({"role": "assistant", "content": response_text})
-            flight_tracker.extract_and_commit_llm_assignment(response_text)
+            new_squawk = freq_manager.extract_and_commit_llm_assignment(response_text)
+            if new_squawk:
+                flight_tracker.assigned_squawk = new_squawk
 
-        # 5. SPEAK (Edge-TTS) + Radio Effect
+        # TTS + Radio Effect
+        if not response_text or not response_text.strip():
+            print("[⚠️ ATC response was empty, skipping audio generation.]")
+            continue
+
         communicate = edge_tts.Communicate(response_text, tts_voice)
-        await communicate.save("response_raw.mp3")
+        
+        try:
+            await communicate.save("response_raw.mp3")
+        except Exception as e:
+            print(f"[⚠️ TTS Generation Error: {e}]")
+            continue
 
-        # Convert to WAV and apply radio bandpass + noise effect
         try:
             from pydub import AudioSegment
             seg = AudioSegment.from_mp3("response_raw.mp3")
             seg.export("response_raw.wav", format="wav")
-            apply_radio_effect("response_raw.wav", "response_processed.wav")
+
+            # Calculate signal strength based on distance
+            signal_strength = max(0.3, 1.0 - (station_distance_nm / max_range) * 0.7)
+            apply_radio_effect("response_raw.wav", "response_processed.wav",
+                            signal_strength=signal_strength, distance_nm=station_distance_nm)
             playback_file = "response_processed.wav"
         except Exception as e:
-            print(f"[pydub not available or conversion failed, using raw mp3: {e}]")
+            print(f"[Audio processing error, using raw: {e}]")
             playback_file = "response_raw.mp3"
 
-        # 🎙️ RADIO CLICK ON
+        # Playback with radio effects
         squelch_sound.play()
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.12)
 
-        # START BACKGROUND STATIC
         static_channel = heavy_static_sound.play(loops=-1)
         if static_channel:
-            static_channel.set_volume(0.04)
+            static_channel.set_volume(0.035)
 
         pygame.mixer.music.load(playback_file)
         pygame.mixer.music.play()
 
-        # Monitor frequency during playback to allow instant cut-off on retune
+        # Monitor for frequency change during playback
         try:
             with get_xp() as xp_monitor:
                 while pygame.mixer.music.get_busy():
@@ -1004,24 +1401,19 @@ async def run_atc_loop():
                             pass
 
                     if abs(current_mhz - com1_mhz) > 0.01:
-                        print("[Frequency changed. Radio transmission cut off.]")
+                        print("[Frequency changed. Transmission cut off.]")
                         pygame.mixer.music.stop()
                         break
-
                     await asyncio.sleep(0.1)
         except Exception:
             while pygame.mixer.music.get_busy():
                 await asyncio.sleep(0.1)
 
-        # STOP BACKGROUND STATIC
         if static_channel:
             static_channel.stop()
 
-        # 🎙️ RADIO CLICK OFF
         squelch_sound.play()
-        await asyncio.sleep(0.2)
-
-        # FIX: unload() already stops music — stop() after is redundant, but harmless; kept for clarity
+        await asyncio.sleep(0.15)
         pygame.mixer.music.unload()
 
 
