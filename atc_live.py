@@ -618,7 +618,8 @@ CRITICAL RULES:
 - For IFR clearances, you MUST use CRAFT format: Clearance limit, Route, Altitude, Frequency, Transponder
 - MUST mention the assigned departure runway (Active runway: {best_runway}).
 - IMPORTANT: Use ACTUAL local frequencies for Departure handoffs. Local frequencies are: {local_freqs}
-- Example: "N12345, cleared to JFK via direct, departure runway {best_runway}, maintain five thousand, departure frequency [USE REAL FREQ], squawk four three two one"
+- ALTITUDE ASSIGNMENT: Assign a realistic INITIAL altitude for a SID (e.g. 4000-8000 ft or FL060) and tell pilot to expect their filed Cruise FL 10 minutes after departure. Do NOT clear them to Cruise FL right away.
+- Example: "N12345, cleared to JFK via direct, departure runway {best_runway}, climb via SID to five thousand, expect flight level three five zero ten minutes after departure, departure frequency [USE REAL FREQ], squawk four three two one"
 - Generate a RANDOM 4-digit Mode-S transponder code between 2000-6277 (never 1200 or 7000)
 - If pilot reads back correctly, say "Readback correct"
 - NEVER approve taxi, takeoff, or pushback during this phase
@@ -659,8 +660,9 @@ CRITICAL RULES:
 
         FlightPhase.CLIMB: f"""Pilot is climbing.
 CRITICAL RULES:
-- Assign altitude consistent with filed altitude or current traffic
+- Assign altitude consistent with filed cruise altitude or current traffic
 - Use proper phraseology: "Climb and maintain flight level [number]"
+- IF pilot was on an initial SID altitude, clear them higher toward their filed Cruise Altitude
 - Provide heading vectors if needed for traffic or airspace
 - Handoff instructions MUST use real frequencies from: {{local_freqs}}
 - FL numbers are spoken as "flight level [three-two-zero]" for 320
@@ -743,7 +745,7 @@ Follow intercept protocols"""
 === FLIGHT PLAN ===
 Destination: {simbrief_data['destination']}
 Route: {simbrief_data['route']}
-Initial Altitude: {simbrief_data['altitude']}"""
+Cruise Altitude: {simbrief_data['altitude']}"""
 
     return f"""You are a professional, certified Air Traffic Controller acting as {atc_role} at {location_name}.
 
@@ -1212,7 +1214,7 @@ async def run_atc_loop():
         if simbrief_data:
             flight_plan_context = (
                 f"IFR plan filed: {simbrief_data['origin']} to {simbrief_data['destination']}, "
-                f"Route: {simbrief_data['route']}, Initial FL: {simbrief_data['altitude']}."
+                f"Route: {simbrief_data['route']}, Cruise FL: {simbrief_data['altitude']}."
             )
 
         # ATC Role
