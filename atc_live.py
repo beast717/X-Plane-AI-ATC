@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict, Tuple, List
 import re
 import struct
+import keyboard
+from airport_routing import fetch_airport_geometry, get_taxi_route
 
 load_dotenv()
 
@@ -44,6 +46,25 @@ PRE_EMPHASIS = 1.5          # High-frequency boost before transmission
 DE_EMPHASIS = 0.7           # High-frequency cut after reception
 
 # --- FLIGHT STATE ENUMS ---
+
+NATO_ALPHABET = {
+    "A": "Alpha", "B": "Bravo", "C": "Charlie", "D": "Delta",
+    "E": "Echo", "F": "Foxtrot", "G": "Golf", "H": "Hotel",
+    "I": "India", "J": "Juliett", "K": "Kilo", "L": "Lima",
+    "M": "Mike", "N": "November", "O": "Oscar", "P": "Papa",
+    "Q": "Quebec", "R": "Romeo", "S": "Sierra", "T": "Tango",
+    "U": "Uniform", "V": "Victor", "W": "Whiskey", "X": "X-ray",
+    "Y": "Yankee", "Z": "Zulu",
+    "0": "Zero", "1": "One", "2": "Two", "3": "Three", "4": "Four",
+    "5": "Five", "6": "Six", "7": "Seven", "8": "Eight", "9": "Niner"
+}
+
+def to_phonetic_string(text: str) -> str:
+    """Accurately converts alphanumeric identifiers (like 'A1' or 'J') to NATO phonetic words ('Alpha One', 'Juliett')."""
+    if not text:
+        return text
+    return " ".join(NATO_ALPHABET.get(char.upper(), char) for char in text.replace(" ", ""))
+
 class FlightPhase(Enum):
     """Detailed flight phase tracking for phase-aware prompting."""
     PREFLIGHT = "preflight"
@@ -349,6 +370,9 @@ def apply_radio_effect(audio_path: str, out_path: str, fs: int = SAMPLE_RATE,
 
         # 7. De-emphasis for receiver
         audio = apply_de_emphasis(audio, sample_rate)
+        
+        # Remove DC offset caused by AM carrier and de-emphasis integration
+        audio = audio - np.mean(audio)
 
         # 8. Compression for consistent loudness
         # Soft knee compressor simulation
@@ -583,17 +607,16 @@ def generate_atis_system_prompt(location_name: str, weather_context: str,
 
 CRITICAL RULES:
 1. Use EXACT format: "{location_name} Airport, information {atis_letter}."
-2. Spell the letter using NATO phonetic alphabet (Alpha, Bravo, Charlie, Delta, Echo, Foxtrot, Golf, Hotel, India, Juliett, Kilo, Lima, Mike, November, Oscar, Papa, Quebec, Romeo, Sierra, Tango, Uniform, Victor, Whiskey, X-ray, Yankee, Zulu)
-3. Translate ALL weather codes into spoken English - NEVER read raw METAR codes
+2. Translate ALL weather codes into spoken English - NEVER read raw METAR codes
    - Wind: "15010KT" → "Wind one five zero at one zero knots"
    - "15010G20KT" → "Wind one five zero at one zero knots gusting two zero"
    - Visibility: "9999" → "Visibility one zero kilometers" or "Cavor one zero"
    - "4500" → "Visibility four thousand five hundred meters"
-4. Use the correct pressure format: {altimeter_phrase}
-5. Active runways: {', '.join(active_runways) if active_runways else 'not available'}
-6. Include NOTAMs if provided: {notams}
-7. NEVER use pleasantries or filler phrases
-8. End exactly with: 'Advise on initial contact you have information {atis_letter}.'
+3. Use the correct pressure format: {altimeter_phrase}
+4. Active runways: {', '.join(active_runways) if active_runways else 'not available'}
+5. Include NOTAMs if provided: {notams}
+6. NEVER use pleasantries or filler phrases
+7. End exactly with: 'Advise on initial contact you have information {atis_letter}.'
 Example: 'JFK Airport information Bravo. Wind two seven zero at one five. Altimeter two niner niner two. ILS runway one niner left in use. Advise on initial contact you have information Bravo.'
 """
 
@@ -634,34 +657,35 @@ CRITICAL RULES:
 - ALTITUDE ASSIGNMENT: Assign a realistic INITIAL altitude for a SID (e.g. 4000-8000 ft or FL060) and tell pilot to expect their filed Cruise FL 10 minutes after departure. Do NOT clear them to Cruise FL right away.
 - Example: "N12345, cleared to JFK via direct, departure runway {best_runway}, climb via SID to five thousand, expect flight level three five zero ten minutes after departure, departure frequency [USE REAL FREQ], squawk four three two one"
 - Generate a RANDOM 4-digit Mode-S transponder code between 2000-6277 (never 1200 or 7000)
-- If pilot reads back correctly, say "Readback correct"
+- If pilot reads back correctly, say ONLY "Readback correct" and their callsign. Do NOT add instructions to contact ground or request pushback.
 - NEVER approve taxi, takeoff, or pushback during this phase
 - Acknowledge SimBrief flight plan if available""",
 
-        FlightPhase.PUSHBACK: """Pilot has requested pushback/startup.
+        FlightPhase.PUSHBACK: """Pilot has requested pushback/startup OR is reading back your clearance.
 CRITICAL RULES:
-- Issue startup approval with pushback direction (e.g., "Face North")
-- Example: "Cessna foxtrot, pushback approved, face north, report ready to taxi"
-- Do NOT issue taxi clearance in same transmission - ONE STEP AT A TIME
-- If pilot reads back, acknowledge briefly with "Roger"
+- If pilot requests pushback: Issue startup approval with pushback direction (e.g., "Face North"). Example: "Cessna foxtrot, pushback approved, face north".
+- If pilot is ONLY reading back your pushback approval: DO NOT ISSUE TAXI INSTRUCTIONS.
+- DO NOT issue taxi clearance until pilot explicitly reports ready to taxi!
 - NEVER re-approve if already approved""",
 
         FlightPhase.TAXI: """Pilot is taxiing.
 CRITICAL RULES:
-- Issue taxi clearance to holding point of assigned runway
-- Include taxiway designators using NATO phonetic alphabet
+- Issue taxi clearance to holding point of assigned runway using the PROVIDED EXACT TAXI ROUTE
+- Strictly adhere to the order of the provided taxiways
 - Include runway holding point and any restrictions
-- Example: "Taxi to holding point runway two seven via Alpha, Bravo, cross runway one niner"
+- Example if route is Alpha, Bravo: "Taxi to holding point runway two seven via Alpha, Bravo"
 - If requesting to cross active runway, require position and hold
 - If pilot states holding short, instruct to contact Tower""",
 
         FlightPhase.HOLD_SHORT: f"""Pilot is holding short of runway.
 CRITICAL RULES:
-- If at Ground frequency: instruct "Contact Tower" and provide REAL local tower frequency from: {local_freqs}
-- If at Tower frequency: issue takeoff clearance OR "Line up and wait"
+- If acting as GROUND: Instruct "Contact Tower" and provide REAL local tower frequency from: {local_freqs}. If the pilot is reading back the handoff, respond ONLY with "Good day". UNDER NO CIRCUMSTANCES issue a takeoff clearance.
+- If acting as TOWER: issue takeoff clearance OR "Line up and wait"
 - Takeoff clearance MUST include wind: "Wind one eight zero at one zero, runway two seven, cleared for takeoff"
 - NEVER issue "line up and wait" and "cleared for takeoff" in same transmission
-- If landing traffic exists, issue "continue, traffic in sight" OR "hold short""",
+- If landing traffic exists, issue "continue, traffic in sight" OR "hold short"
+- IF THE PILOT IS READING BACK YOUR TAKEOFF CLEARANCE: You MUST respond ONLY with their callsign or "Roger". Do NOT issue a handoff to departure, and do NOT give any further instructions. Wait for them to become airborne.
+""",
 
         FlightPhase.TAKEOFF: f"""Pilot is in takeoff roll OR just airborne.
 CRITICAL RULES:
@@ -789,7 +813,7 @@ Taxi Route: {', '.join(flight_tracker.taxi_instructions) if flight_tracker.taxi_
 === REAL-WORLD CONTEXT ===
 Weather: {weather_context}
 Active Runway: {best_runway if best_runway else 'Runway 27'}
-Available Taxiways: {', '.join(taxiways) if taxiways else 'Alpha, Bravo, Charlie'}
+Calculated Taxi Route: {', '.join(taxiways) if (flight_tracker.phase in [FlightPhase.TAXI, FlightPhase.TAXI_IN, FlightPhase.LANDED] and taxiways) else 'DO NOT ISSUE TAXI YET'}
 Altimeter: {altimeter_phrase}
 {simbrief_data_block}
 
@@ -809,10 +833,9 @@ Altimeter: {altimeter_phrase}
    - Do NOT issue conflicting clearances after handoff
 
 4. READBACK RULES:
-   - If pilot reads back clearance correctly: acknowledge "Roger" or callsign ONLY
-   - If readback incorrect: interrupt with correction
-   - In PREFLIGHT IFR clearances: MUST say "Readback correct" for correct readback
-   - Do NOT say "readback correct" in other phases - use "Roger" or callsign
+   - For PREFLIGHT IFR clearances: MUST say ONLY "Readback correct" completely omitting any handoff or pushback/taxi instructions. Let the pilot initiate the next phase.
+   - For ALL OTHER PHASES (Pushback, Taxi, Takeoff, etc.): DO NOT say "Roger", "Readback correct", or acknowledge the readback in any way if it is correct. Be realistically concise. (A simple "Good Day" during handoffs is acceptable).
+   - If readback is incorrect: interrupt immediately with the correction.
 
 5. PHRASEOLOGY STANDARDS:
    - Use NATO phonetic alphabet for letters (Alpha, Bravo, Charlie...)
@@ -928,31 +951,6 @@ async def run_atc_loop():
 
         runway_cache[cache_key] = runways
         return runways
-
-    def get_taxiways_from_overpass(lat, lon, radius=5000):
-        cache_key = f"{round(lat, 2)},{round(lon, 2)}"
-        if cache_key in taxiway_cache:
-            return taxiway_cache[cache_key]
-
-        print("🚖 Querying real-world aviation databases for taxiways...")
-        query = f"""
-        [out:json][timeout:2];
-        way["aeroway"="taxiway"](around:{radius},{lat},{lon});
-        out tags;
-        """
-        data = query_overpass_with_retries(query, timeout=5.0)
-
-        taxiways = []
-        if data:
-            for element in data.get('elements', []):
-                tags = element.get('tags', {})
-                ref = tags.get('ref')
-                if ref and len(ref) <= 3:
-                    taxiways.append(ref.upper())
-            taxiways = list(set(taxiways))
-
-        taxiway_cache[cache_key] = taxiways
-        return taxiways
 
     def get_location_name(lat, lon):
         cache_key = f"{round(lat, 1)},{round(lon, 1)}"
@@ -1193,7 +1191,7 @@ async def run_atc_loop():
         if lat != 0.0 and lon != 0.0:
             active_runways = get_runways_from_overpass(lat, lon)
             best_active_runway = get_best_runway(active_runways, wind_dir)
-            active_taxiways = get_taxiways_from_overpass(lat, lon)
+            active_taxiways = [to_phonetic_string(twy) for twy in get_taxi_route(lat, lon, best_active_runway)]
             location_name = get_location_name(lat, lon)
 
             # --- PRECISION VECTORING CALCULATION ---
@@ -1293,11 +1291,11 @@ async def run_atc_loop():
 
         # Proactive phase updates
         user_text_lower = user_text.lower()
-        if flight_tracker.phase == FlightPhase.PREFLIGHT and any(x in user_text_lower for x in ["push", "start"]):
+        if flight_tracker.phase == FlightPhase.PREFLIGHT and any(x in user_text_lower for x in ["request push", "ready to push", "ready for start", "request start"]):
             flight_tracker.update_phase(FlightPhase.PUSHBACK)
-        elif flight_tracker.phase == FlightPhase.PUSHBACK and "taxi" in user_text_lower:
+        elif flight_tracker.phase == FlightPhase.PUSHBACK and any(x in user_text_lower for x in ["request taxi", "ready to taxi", "ready for taxi"]):
             flight_tracker.update_phase(FlightPhase.TAXI)
-        elif flight_tracker.phase == FlightPhase.TAXI and any(x in user_text_lower for x in ["short", "runway"]):
+        elif flight_tracker.phase == FlightPhase.TAXI and any(x in user_text_lower for x in ["holding short", "approaching holding", "approaching runway"]):
             flight_tracker.update_phase(FlightPhase.HOLD_SHORT)
 
         # GET AI RESPONSE
@@ -1307,9 +1305,12 @@ async def run_atc_loop():
             print(f"📻 Generating ATIS for {location_name}...")
             atis_number = int((time.time() // 3600) % 26)
             atis_letter = chr(65 + atis_number)
+            
+            phonetic_letter = to_phonetic_string(atis_letter)
+            
             system_prompt = generate_atis_system_prompt(
                 location_name, weather_context, active_runways,
-                altimeter_phrase, atis_type, atis_letter
+                altimeter_phrase, atis_type, phonetic_letter
             )
             messages = [{"role": "system", "content": system_prompt}]
         elif action == "GUARD":
